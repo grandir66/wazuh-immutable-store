@@ -24,6 +24,7 @@ from transfer import TransferManager, NFSManager
 from retention import RetentionManager
 from recovery import RecoveryManager
 from wizard import SetupWizard
+from menu import InteractiveMenu
 
 
 # Configure logging
@@ -265,7 +266,7 @@ class WazuhImmutableStore:
 
         return result
 
-    def list_archives(self, format_output: str = 'table'):
+    def list_archives(self, format_output: str = 'table', start_date: str = None, end_date: str = None):
         """List available archives"""
         recovery_manager = RecoveryManager(
             self.models['archive'].temp_dir,
@@ -274,7 +275,27 @@ class WazuhImmutableStore:
             self.models['integrity']
         )
 
-        archives = recovery_manager.list_available_archives()
+        # Filter by date if provided
+        if start_date:
+            from datetime import datetime
+            start = datetime.fromisoformat(start_date)
+            end = datetime.fromisoformat(end_date) if end_date else datetime.now()
+            archives = [
+                {
+                    'name': a.name,
+                    'path': str(a.path),
+                    'size': a.size,
+                    'size_mb': round(a.size / (1024 * 1024), 2),
+                    'created': a.created.isoformat(),
+                    'has_signature': a.has_signature,
+                    'has_checksum': a.has_checksum,
+                    'location': 'remote' if self.models['qnap'].mount_point and
+                               str(self.models['qnap'].mount_point) in str(a.path) else 'local'
+                }
+                for a in recovery_manager.searcher.find_archives_by_date_range(start, end)
+            ]
+        else:
+            archives = recovery_manager.list_available_archives()
 
         if format_output == 'json':
             print(json.dumps(archives, indent=2))
@@ -284,6 +305,70 @@ class WazuhImmutableStore:
             for a in archives:
                 print(f"{a['name']:<50} {a['size_mb']:<12.2f} {a['location']:<10} {a['created'][:19]}")
             print(f"\nTotal: {len(archives)} archives")
+
+    def browse_archive(self, archive_name: str):
+        """Browse contents of an archive"""
+        recovery_manager = RecoveryManager(
+            self.models['archive'].temp_dir,
+            self.models['qnap'].mount_point,
+            self.models['gpg'],
+            self.models['integrity']
+        )
+
+        archive = recovery_manager.searcher.find_archive_by_name(archive_name)
+        if not archive:
+            print(f"Archivio non trovato: {archive_name}")
+            return
+
+        contents = recovery_manager.recovery.list_archive_contents(archive)
+
+        print(f"\n{'=' * 60}")
+        print(f"Archivio: {archive.name}")
+        print(f"Dimensione: {archive.size / (1024*1024):.2f} MB")
+        print(f"Data: {archive.created.isoformat()[:19]}")
+        print(f"Firma GPG: {'Sì' if archive.has_signature else 'No'}")
+        print(f"Checksum: {'Sì' if archive.has_checksum else 'No'}")
+        print(f"{'=' * 60}")
+        print(f"\nContenuto ({len(contents)} elementi):\n")
+
+        for item in contents:
+            if item['is_dir']:
+                print(f"  [DIR]  {item['name']}")
+            else:
+                size_kb = item['size'] / 1024
+                print(f"  [FILE] {item['name']} ({size_kb:.1f} KB)")
+
+    def show_stats(self):
+        """Show archive statistics"""
+        recovery_manager = RecoveryManager(
+            self.models['archive'].temp_dir,
+            self.models['qnap'].mount_point,
+            self.models['gpg'],
+            self.models['integrity']
+        )
+
+        stats = recovery_manager.get_recovery_statistics()
+
+        print(f"\n{'=' * 60}")
+        print("Statistiche Archivi")
+        print(f"{'=' * 60}")
+        print(f"\n  Archivi totali:     {stats['total_archives']}")
+        print(f"  Dimensione totale:  {stats['total_size_gb']:.2f} GB")
+        print(f"  Archivi locali:     {stats['local_count']}")
+        print(f"  Archivi remoti:     {stats['remote_count']}")
+        print(f"  Con firma GPG:      {stats['with_signature']}")
+        print(f"  Con checksum:       {stats['with_checksum']}")
+
+        if stats['date_range']['oldest']:
+            print(f"\n  Archivio più vecchio: {stats['date_range']['oldest'][:10]}")
+            print(f"  Archivio più recente: {stats['date_range']['newest'][:10]}")
+
+        print(f"\n{'=' * 60}")
+
+    def run_interactive_menu(self):
+        """Run interactive menu"""
+        menu = InteractiveMenu(self)
+        menu.run()
 
     def check_status(self):
         """Check system status"""
@@ -417,6 +502,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Comandi disponibili:
+  menu            Avvia il menu interattivo
   setup           Esegue il wizard di configurazione iniziale
   status          Mostra lo stato del sistema
   test            Testa connessione NFS e permessi
@@ -425,8 +511,11 @@ Comandi disponibili:
   verify          Verifica l'integrità degli archivi
   recover         Recupera archivi da un intervallo di date
   list            Lista gli archivi disponibili
+  browse          Visualizza il contenuto di un archivio
+  stats           Mostra statistiche degli archivi
 
 Esempi:
+  wazuh-immutable-store menu                     # Menu interattivo
   wazuh-immutable-store setup                    # Configurazione iniziale
   wazuh-immutable-store status                   # Verifica stato
   wazuh-immutable-store test                     # Test connessione NFS
@@ -435,13 +524,16 @@ Esempi:
   wazuh-immutable-store verify                   # Verifica integrità
   wazuh-immutable-store list                     # Lista archivi
   wazuh-immutable-store list --format json       # Lista in JSON
+  wazuh-immutable-store list --start 2025-01-01 --end 2025-01-31  # Filtra per data
+  wazuh-immutable-store browse <nome-archivio>   # Sfoglia contenuto archivio
+  wazuh-immutable-store stats                    # Statistiche archivi
   wazuh-immutable-store recover --start 2025-01-01 --end 2025-01-31 --output /tmp/recovery
         """
     )
 
-    parser.add_argument('command', nargs='?', default='status',
-                        choices=['setup', 'archive', 'retention', 'verify',
-                                 'recover', 'list', 'status', 'test'],
+    parser.add_argument('command', nargs='?', default='menu',
+                        choices=['menu', 'setup', 'archive', 'retention', 'verify',
+                                 'recover', 'list', 'status', 'test', 'browse', 'stats'],
                         help='Comando da eseguire')
 
     parser.add_argument('-c', '--config', type=Path,
@@ -465,6 +557,9 @@ Esempi:
     parser.add_argument('--no-verify', action='store_true',
                         help='Salta verifica durante recovery')
 
+    parser.add_argument('--archive-name', type=str,
+                        help='Nome archivio per browse')
+
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='Output dettagliato')
 
@@ -474,10 +569,22 @@ Esempi:
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    # Handle setup command
+    # Handle setup command (no config needed)
     if args.command == 'setup':
         wizard = SetupWizard()
         sys.exit(0 if wizard.run() else 1)
+
+    # Handle menu command - loads config internally
+    if args.command == 'menu':
+        try:
+            app = WazuhImmutableStore(args.config)
+            app.load_config()
+            app.run_interactive_menu()
+            sys.exit(0)
+        except FileNotFoundError:
+            print("Configurazione non trovata. Avvio wizard di setup...")
+            wizard = SetupWizard()
+            sys.exit(0 if wizard.run() else 1)
 
     # Load configuration for other commands
     try:
@@ -511,7 +618,25 @@ Esempi:
                         verify=not args.no_verify)
 
         elif args.command == 'list':
-            app.list_archives(format_output=args.format)
+            app.list_archives(format_output=args.format,
+                            start_date=args.start,
+                            end_date=args.end)
+
+        elif args.command == 'browse':
+            if not args.archive_name:
+                # Check if archive name is in remaining args
+                remaining = [a for a in sys.argv[2:] if not a.startswith('-')]
+                if remaining:
+                    app.browse_archive(remaining[0])
+                else:
+                    print("Errore: specificare il nome dell'archivio")
+                    print("Uso: wazuh-immutable-store browse <nome-archivio>")
+                    sys.exit(1)
+            else:
+                app.browse_archive(args.archive_name)
+
+        elif args.command == 'stats':
+            app.show_stats()
 
         elif args.command == 'status':
             app.check_status()
