@@ -1,0 +1,13 @@
+[Unit]
+Description=Wazuh Immutable Store - Daily Retention Timer
+Documentation=https://github.com/your-repo/wazuh-immutable-store
+
+[Timer]
+# Run daily at 3:00 AM (after archive at 2:00 AM)
+OnCalendar=*-*-* 03:00:00
+RandomizedDelaySec=900
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

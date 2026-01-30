@@ -1,0 +1,40 @@
+[Unit]
+Description=Wazuh Immutable Store - Log Archive Service
+Documentation=https://github.com/your-repo/wazuh-immutable-store
+After=network-online.target remote-fs.target wazuh-manager.service
+Wants=network-online.target
+Requires=remote-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/wazuh-immutable-store archive
+User=root
+Group=root
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wazuh-immutable-store
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+
+# Allow access to necessary directories
+ReadWritePaths=/var/ossec/logs
+ReadWritePaths=/tmp/wazuh-archive
+ReadWritePaths=/var/log
+ReadWritePaths=/etc/wazuh-immutable-store
+ReadWritePaths=/mnt/qnap-wazuh
+
+# Resource limits
+MemoryMax=2G
+CPUQuota=50%
+
+[Install]
+WantedBy=multi-user.target

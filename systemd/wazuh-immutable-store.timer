@@ -1,0 +1,16 @@
+[Unit]
+Description=Wazuh Immutable Store - Daily Archive Timer
+Documentation=https://github.com/your-repo/wazuh-immutable-store
+
+[Timer]
+# Run daily at 2:00 AM
+OnCalendar=*-*-* 02:00:00
+# Randomize start time by up to 30 minutes to avoid thundering herd
+RandomizedDelaySec=1800
+# Run immediately if last run was missed (e.g., system was off)
+Persistent=true
+# Ensure service completes before next trigger
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

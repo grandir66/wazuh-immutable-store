@@ -1,0 +1,17 @@
+# Wazuh Immutable Store - Python Dependencies
+
+# Configuration
+PyYAML>=6.0
+
+# Optional: For advanced logging
+# python-json-logger>=2.0.0
+
+# Optional: For email notifications
+# secure-smtplib>=0.1.1
+
+# Development dependencies (uncomment for development)
+# pytest>=7.0.0
+# pytest-cov>=4.0.0
+# black>=23.0.0
+# flake8>=6.0.0
+# mypy>=1.0.0

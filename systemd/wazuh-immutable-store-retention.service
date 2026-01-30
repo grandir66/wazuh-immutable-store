@@ -1,0 +1,30 @@
+[Unit]
+Description=Wazuh Immutable Store - Retention Cleanup Service
+Documentation=https://github.com/your-repo/wazuh-immutable-store
+After=network-online.target remote-fs.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/wazuh-immutable-store retention
+User=root
+Group=root
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wazuh-immutable-store-retention
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+
+# Allow access to necessary directories
+ReadWritePaths=/tmp/wazuh-archive
+ReadWritePaths=/var/log
+ReadWritePaths=/etc/wazuh-immutable-store
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,110 @@
+# Wazuh Immutable Store - Configuration File
+# Copy this file to config.yaml and customize
+
+# Wazuh source configuration
+wazuh:
+  # Path to Wazuh logs directory
+  logs_path: /var/ossec/logs/archives
+  # Log file pattern to archive
+  file_pattern: "archives.json"
+  # Include alerts as well
+  include_alerts: true
+  alerts_path: /var/ossec/logs/alerts
+
+# QNAP NFS configuration
+qnap:
+  # NFS server hostname or IP
+  host: "192.168.1.100"
+  # NFS export path
+  export_path: "/wazuh-archive"
+  # Local mount point
+  mount_point: /mnt/qnap-wazuh
+  # NFS version (3 or 4)
+  nfs_version: 4
+  # Mount options
+  mount_options: "hard,intr,rsize=65536,wsize=65536"
+
+# Archive settings
+archive:
+  # Compression algorithm (gzip, bz2, xz)
+  compression: gzip
+  # Compression level (1-9)
+  compression_level: 6
+  # Archive naming pattern
+  naming_pattern: "wazuh-logs-{date}-{hour}.tar.gz"
+  # Temporary directory for archive creation
+  temp_dir: /tmp/wazuh-archive
+  # Create hourly or daily archives
+  interval: daily  # hourly, daily
+
+# GPG signing configuration
+gpg:
+  # Enable GPG signing
+  enabled: true
+  # GPG key ID for signing
+  key_id: ""
+  # Path to GPG home directory (optional)
+  gpg_home: ""
+  # Create detached signature
+  detached: true
+
+# Integrity verification
+integrity:
+  # Hash algorithm (sha256, sha512)
+  algorithm: sha256
+  # Create manifest file with all hashes
+  create_manifest: true
+  # Chain manifests (each manifest includes previous hash)
+  chain_manifests: true
+
+# Retention policies
+retention:
+  local:
+    # Days to keep logs locally before archiving
+    days_before_archive: 1
+    # Days to keep archived logs locally
+    days_keep_local: 7
+    # Delete local after successful remote transfer
+    delete_after_transfer: true
+  remote:
+    # Retention period on QNAP (in days, 0 = forever)
+    # Note: QNAP WORM policy will enforce minimum retention
+    days: 2555  # ~7 years
+    # Organize archives by year/month
+    organize_by_date: true
+
+# Scheduling
+schedule:
+  # Archive creation time (cron format)
+  archive_cron: "0 2 * * *"  # 2 AM daily
+  # Integrity check schedule
+  integrity_check_cron: "0 6 * * 0"  # Sunday 6 AM
+  # Cleanup schedule
+  cleanup_cron: "0 3 * * *"  # 3 AM daily
+
+# Notifications
+notifications:
+  # Enable email notifications
+  email:
+    enabled: false
+    smtp_server: ""
+    smtp_port: 587
+    username: ""
+    password: ""
+    from_address: ""
+    to_addresses: []
+  # Syslog notifications
+  syslog:
+    enabled: true
+    facility: local0
+
+# Logging
+logging:
+  # Log level (DEBUG, INFO, WARNING, ERROR)
+  level: INFO
+  # Log file path
+  file: /var/log/wazuh-immutable-store.log
+  # Max log file size in MB
+  max_size: 100
+  # Number of backup files to keep
+  backup_count: 5

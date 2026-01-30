@@ -1,0 +1,13 @@
+[Unit]
+Description=Wazuh Immutable Store - Weekly Integrity Verification Timer
+Documentation=https://github.com/your-repo/wazuh-immutable-store
+
+[Timer]
+# Run weekly on Sunday at 6:00 AM
+OnCalendar=Sun *-*-* 06:00:00
+RandomizedDelaySec=1800
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
