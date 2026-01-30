@@ -296,17 +296,37 @@ class WazuhImmutableStore:
         connected, message = nfs_manager.check_connectivity()
 
         print(f"\nQNAP NFS Server: {self.models['qnap'].host}")
-        print(f"  Status: {'Connected' if connected else 'Not Connected'}")
+        print(f"  Export: {self.models['qnap'].export_path}")
+        print(f"  Mount point: {self.models['qnap'].mount_point}")
+        print(f"  Status: {'✓ Connected' if connected else '✗ Not Connected'}")
         print(f"  Message: {message}")
-        print(f"  Mounted: {'Yes' if nfs_manager.is_mounted() else 'No'}")
+        print(f"  Mounted: {'✓ Yes' if nfs_manager.is_mounted() else '✗ No'}")
 
         if nfs_manager.is_mounted():
             usage = nfs_manager.get_disk_usage()
             if usage:
                 print(f"  Disk Usage: {usage['used']} / {usage['size']} ({usage['use_percent']})")
+        else:
+            nfs_ver = self.models['qnap'].nfs_version
+            mount_opts = self.models['qnap'].mount_options
+            host = self.models['qnap'].host
+            export = self.models['qnap'].export_path
+            mount_point = self.models['qnap'].mount_point
+            print(f"\n  Per montare manualmente:")
+            print(f"  sudo mount -t nfs -o vers={nfs_ver},{mount_opts} {host}:{export} {mount_point}")
+
+        # Check Wazuh logs
+        print(f"\nWazuh Logs:")
+        print(f"  Path: {self.models['wazuh'].logs_path}")
+        logs_exist = self.models['wazuh'].logs_path.exists()
+        print(f"  Exists: {'✓ Yes' if logs_exist else '✗ No'}")
+        if logs_exist:
+            import os
+            log_files = list(self.models['wazuh'].logs_path.rglob('*'))
+            print(f"  Files found: {len(log_files)}")
 
         # Check GPG
-        print(f"\nGPG Signing: {'Enabled' if self.models['gpg'].enabled else 'Disabled'}")
+        print(f"\nGPG Signing: {'✓ Enabled' if self.models['gpg'].enabled else '○ Disabled'}")
         if self.models['gpg'].enabled:
             print(f"  Key ID: {self.models['gpg'].key_id}")
 
@@ -316,7 +336,78 @@ class WazuhImmutableStore:
         print(f"  Remote: {self.models['retention'].remote.days} days "
               f"({self.models['retention'].remote.days // 365} years)")
 
+        # Show archive settings
+        print(f"\nArchive Settings:")
+        print(f"  Compression: {self.models['archive'].compression.value}")
+        print(f"  Interval: {self.models['archive'].interval.value}")
+        print(f"  Temp dir: {self.models['archive'].temp_dir}")
+
         print("\n" + "=" * 60)
+
+    def test_connection(self):
+        """Test NFS connection and write permissions"""
+        print("\n" + "=" * 60)
+        print("Wazuh Immutable Store - Connection Test")
+        print("=" * 60)
+
+        nfs_manager = NFSManager(self.models['qnap'])
+
+        # Test 1: Check connectivity
+        print("\n[1/4] Testing NFS server connectivity...")
+        connected, message = nfs_manager.check_connectivity()
+        if connected:
+            print(f"  ✓ {message}")
+        else:
+            print(f"  ✗ {message}")
+            print(f"\n  Suggerimento: Verifica che il QNAP sia raggiungibile")
+            print(f"  ping {self.models['qnap'].host}")
+            return False
+
+        # Test 2: Check if mounted
+        print("\n[2/4] Checking NFS mount...")
+        if nfs_manager.is_mounted():
+            print(f"  ✓ NFS is mounted at {self.models['qnap'].mount_point}")
+        else:
+            print(f"  ✗ NFS is not mounted")
+            print(f"\n  Montare con:")
+            nfs_ver = self.models['qnap'].nfs_version
+            mount_opts = self.models['qnap'].mount_options
+            host = self.models['qnap'].host
+            export = self.models['qnap'].export_path
+            mount_point = self.models['qnap'].mount_point
+            print(f"  sudo mount -t nfs -o vers={nfs_ver},{mount_opts} {host}:{export} {mount_point}")
+            return False
+
+        # Test 3: Check write permissions
+        print("\n[3/4] Testing write permissions...")
+        test_file = self.models['qnap'].mount_point / '.wazuh-test-write'
+        try:
+            test_file.write_text("test")
+            test_file.unlink()
+            print(f"  ✓ Write permissions OK")
+        except PermissionError:
+            print(f"  ✗ Permission denied - cannot write to NFS share")
+            print(f"\n  Sul QNAP verifica:")
+            print(f"  1. L'IP di questo server è autorizzato nell'export NFS")
+            print(f"  2. Squash è impostato su 'No mapping' o 'Map root to admin'")
+            return False
+        except Exception as e:
+            print(f"  ✗ Error: {e}")
+            return False
+
+        # Test 4: Check Wazuh logs
+        print("\n[4/4] Checking Wazuh logs...")
+        if self.models['wazuh'].logs_path.exists():
+            log_files = list(self.models['wazuh'].logs_path.rglob('*.json'))
+            print(f"  ✓ Found {len(log_files)} JSON log files")
+        else:
+            print(f"  ✗ Wazuh logs path not found: {self.models['wazuh'].logs_path}")
+            return False
+
+        print("\n" + "=" * 60)
+        print("  ✓ All tests passed! System is ready.")
+        print("=" * 60)
+        return True
 
 
 def main():
@@ -327,24 +418,30 @@ def main():
         epilog="""
 Comandi disponibili:
   setup           Esegue il wizard di configurazione iniziale
+  status          Mostra lo stato del sistema
+  test            Testa connessione NFS e permessi
   archive         Esegue un ciclo di archiviazione
   retention       Esegue il ciclo di retention/pulizia
   verify          Verifica l'integrità degli archivi
   recover         Recupera archivi da un intervallo di date
   list            Lista gli archivi disponibili
-  status          Mostra lo stato del sistema
 
 Esempi:
-  wazuh-immutable-store setup
-  wazuh-immutable-store archive --dry-run
+  wazuh-immutable-store setup                    # Configurazione iniziale
+  wazuh-immutable-store status                   # Verifica stato
+  wazuh-immutable-store test                     # Test connessione NFS
+  wazuh-immutable-store archive --dry-run        # Test archiviazione
+  wazuh-immutable-store archive                  # Archiviazione reale
+  wazuh-immutable-store verify                   # Verifica integrità
+  wazuh-immutable-store list                     # Lista archivi
+  wazuh-immutable-store list --format json       # Lista in JSON
   wazuh-immutable-store recover --start 2025-01-01 --end 2025-01-31 --output /tmp/recovery
-  wazuh-immutable-store list --format json
         """
     )
 
     parser.add_argument('command', nargs='?', default='status',
                         choices=['setup', 'archive', 'retention', 'verify',
-                                 'recover', 'list', 'status'],
+                                 'recover', 'list', 'status', 'test'],
                         help='Comando da eseguire')
 
     parser.add_argument('-c', '--config', type=Path,
@@ -418,6 +515,10 @@ Esempi:
 
         elif args.command == 'status':
             app.check_status()
+
+        elif args.command == 'test':
+            success = app.test_connection()
+            sys.exit(0 if success else 1)
 
     except KeyboardInterrupt:
         print("\nOperazione annullata")

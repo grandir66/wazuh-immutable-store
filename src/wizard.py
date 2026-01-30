@@ -718,38 +718,164 @@ Expire-Date: 0
             except PermissionError:
                 self.print_warning(f"Impossibile creare {d} - creare manualmente con sudo")
 
+    def get_local_ip(self) -> str:
+        """Get local IP address"""
+        try:
+            import socket
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect((self.config['qnap']['host'], 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return "<IP_SERVER_WAZUH>"
+
     def show_next_steps(self):
         """Show next steps after configuration"""
+        nfs_ver = self.config['qnap']['nfs_version']
+        host = self.config['qnap']['host']
+        export = self.config['qnap']['export_path']
+        mount_point = self.config['qnap']['mount_point']
+        mount_opts = self.config['qnap']['mount_options']
+        local_ip = self.get_local_ip()
+
         self.print_header("Prossimi Passi")
 
+        # QNAP Configuration
         print(f"""
-{Colors.BOLD}1. Configurazione QNAP (manuale):{Colors.ENDC}
-   - Creare volume WORM su QNAP
-   - Configurare export NFS: {self.config['qnap']['export_path']}
-   - Autorizzare l'IP del server Wazuh
+{Colors.BOLD}{'='*60}{Colors.ENDC}
+{Colors.BOLD}  FASE 1: CONFIGURAZIONE QNAP (da fare sul NAS){Colors.ENDC}
+{Colors.BOLD}{'='*60}{Colors.ENDC}
 
-{Colors.BOLD}2. Mount NFS:{Colors.ENDC}
-   sudo mount -t nfs{self.config['qnap']['nfs_version']} \\
-       -o {self.config['qnap']['mount_options']} \\
-       {self.config['qnap']['host']}:{self.config['qnap']['export_path']} \\
-       {self.config['qnap']['mount_point']}
+{Colors.CYAN}1.1 Creazione Volume WORM:{Colors.ENDC}
+    - Accedi all'interfaccia web QNAP: https://{host}:8080
+    - Vai su: Storage & Snapshots → Storage/Snapshots
+    - Click "Create" → "New Volume"
+    - Seleziona "Thick Volume"
+    - {Colors.WARNING}IMPORTANTE: Abilita "WORM" (Write Once Read Many){Colors.ENDC}
+    - Imposta retention period: {self.config['retention']['remote']['days']} giorni
+    - Modalità consigliata: "Enterprise" (permette admin override)
 
-{Colors.BOLD}3. Aggiungere a /etc/fstab per mount automatico:{Colors.ENDC}
-   {self.config['qnap']['host']}:{self.config['qnap']['export_path']} {self.config['qnap']['mount_point']} nfs{self.config['qnap']['nfs_version']} {self.config['qnap']['mount_options']},_netdev 0 0
+{Colors.CYAN}1.2 Creazione Shared Folder:{Colors.ENDC}
+    - Vai su: Control Panel → Shared Folders
+    - Click "Create" → "Shared Folder"
+    - Nome: wazuh-archive
+    - Seleziona il volume WORM creato
+    - Path: {export}
 
-{Colors.BOLD}4. Installare e avviare il servizio:{Colors.ENDC}
-   sudo cp systemd/wazuh-immutable-store.service /etc/systemd/system/
-   sudo systemctl daemon-reload
-   sudo systemctl enable wazuh-immutable-store
-   sudo systemctl start wazuh-immutable-store
+{Colors.CYAN}1.3 Configurazione NFS Export:{Colors.ENDC}
+    - Seleziona la cartella "wazuh-archive"
+    - Click "Edit" → "NFS host access"
+    - Aggiungi nuova regola:
 
-{Colors.BOLD}5. Verificare lo stato:{Colors.ENDC}
-   sudo systemctl status wazuh-immutable-store
-   sudo journalctl -u wazuh-immutable-store -f
+      {Colors.GREEN}┌─────────────────────────────────────────────┐
+      │  Host/IP:    {local_ip:<28} │
+      │  Permission: Read/Write                   │
+      │  Squash:     No mapping (o Map root admin)│
+      │  Security:   sys (AUTH_SYS)               │
+      └─────────────────────────────────────────────┘{Colors.ENDC}
 
-{Colors.BOLD}6. Test manuale:{Colors.ENDC}
-   wazuh-immutable-store --test-archive
-   wazuh-immutable-store --verify-integrity
+    - Click "Apply"
+
+{Colors.CYAN}1.4 Abilita servizio NFS:{Colors.ENDC}
+    - Control Panel → Network & File Services → NFS Service
+    - Abilita NFSv{nfs_ver}
+""")
+
+        # Mount commands
+        print(f"""
+{Colors.BOLD}{'='*60}{Colors.ENDC}
+{Colors.BOLD}  FASE 2: MOUNT NFS (da fare sul server Wazuh){Colors.ENDC}
+{Colors.BOLD}{'='*60}{Colors.ENDC}
+
+{Colors.CYAN}2.1 Verifica export disponibili:{Colors.ENDC}
+    showmount -e {host}
+
+{Colors.CYAN}2.2 Mount manuale (per test):{Colors.ENDC}
+    sudo mount -t nfs -o vers={nfs_ver},{mount_opts} {host}:{export} {mount_point}
+
+{Colors.CYAN}2.3 Verifica mount:{Colors.ENDC}
+    df -h {mount_point}
+    touch {mount_point}/test.txt && rm {mount_point}/test.txt
+
+{Colors.CYAN}2.4 Mount automatico - aggiungi a /etc/fstab:{Colors.ENDC}
+    echo "{host}:{export} {mount_point} nfs vers={nfs_ver},{mount_opts},_netdev 0 0" | sudo tee -a /etc/fstab
+
+{Colors.CYAN}2.5 Applica fstab:{Colors.ENDC}
+    sudo mount -a
+""")
+
+        # Service installation
+        print(f"""
+{Colors.BOLD}{'='*60}{Colors.ENDC}
+{Colors.BOLD}  FASE 3: ATTIVAZIONE SERVIZI{Colors.ENDC}
+{Colors.BOLD}{'='*60}{Colors.ENDC}
+
+{Colors.CYAN}3.1 Abilita i timer systemd:{Colors.ENDC}
+    sudo systemctl enable --now wazuh-immutable-store.timer
+    sudo systemctl enable --now wazuh-immutable-store-retention.timer
+    sudo systemctl enable --now wazuh-immutable-store-verify.timer
+
+{Colors.CYAN}3.2 Verifica timer attivi:{Colors.ENDC}
+    systemctl list-timers | grep wazuh
+""")
+
+        # Test commands
+        print(f"""
+{Colors.BOLD}{'='*60}{Colors.ENDC}
+{Colors.BOLD}  FASE 4: TEST E VERIFICA{Colors.ENDC}
+{Colors.BOLD}{'='*60}{Colors.ENDC}
+
+{Colors.CYAN}4.1 Verifica stato sistema:{Colors.ENDC}
+    wazuh-immutable-store status
+
+{Colors.CYAN}4.2 Test archiviazione (senza modifiche):{Colors.ENDC}
+    wazuh-immutable-store archive --dry-run
+
+{Colors.CYAN}4.3 Esegui archiviazione reale:{Colors.ENDC}
+    wazuh-immutable-store archive
+
+{Colors.CYAN}4.4 Verifica integrità:{Colors.ENDC}
+    wazuh-immutable-store verify
+
+{Colors.CYAN}4.5 Lista archivi:{Colors.ENDC}
+    wazuh-immutable-store list
+
+{Colors.CYAN}4.6 Monitora log:{Colors.ENDC}
+    sudo journalctl -u wazuh-immutable-store -f
+""")
+
+        # Troubleshooting
+        print(f"""
+{Colors.BOLD}{'='*60}{Colors.ENDC}
+{Colors.BOLD}  TROUBLESHOOTING{Colors.ENDC}
+{Colors.BOLD}{'='*60}{Colors.ENDC}
+
+{Colors.WARNING}Errore "Permission denied" su NFS:{Colors.ENDC}
+    - Verifica che l'IP {local_ip} sia nell'export QNAP
+    - Verifica che "Squash" sia impostato su "No mapping"
+    - Sul QNAP: Control Panel → Shared Folders → Edit → NFS host access
+
+{Colors.WARNING}Errore "mount.nfs: Protocol not supported":{Colors.ENDC}
+    - NFSv4 non supportato, usa NFSv3:
+    sudo mount -t nfs -o vers=3,{mount_opts} {host}:{export} {mount_point}
+
+{Colors.WARNING}Errore "Connection refused":{Colors.ENDC}
+    - Verifica che NFS sia abilitato sul QNAP
+    - Verifica firewall: porte 111, 2049
+
+{Colors.WARNING}Comandi utili:{Colors.ENDC}
+    # Smonta NFS
+    sudo umount {mount_point}
+
+    # Verifica connettività
+    ping {host}
+
+    # Mostra export NFS
+    showmount -e {host}
+
+    # Stato servizi
+    systemctl status wazuh-immutable-store.timer
 """)
 
 
