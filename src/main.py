@@ -23,6 +23,7 @@ from signer import SigningManager, GPGSigner, IntegrityManager
 from transfer import TransferManager, NFSManager
 from retention import RetentionManager
 from recovery import RecoveryManager
+from historical import HistoricalArchiveManager, HistoricalLogsScanner, WazuhLogsCleaner
 from wizard import SetupWizard
 from menu import InteractiveMenu
 
@@ -371,6 +372,97 @@ class WazuhImmutableStore:
         menu = InteractiveMenu(self)
         menu.run()
 
+    def analyze_historical(self):
+        """Analyze historical Wazuh logs"""
+        logger.info("Analyzing historical logs...")
+
+        historical_manager = HistoricalArchiveManager(
+            self.models['wazuh'],
+            self.models['archive'],
+            self.models['retention'],
+            self.models['qnap'].mount_point
+        )
+
+        analysis = historical_manager.analyze_historical_logs()
+
+        print(f"\n{'=' * 60}")
+        print("Analisi Log Storici Wazuh")
+        print(f"{'=' * 60}")
+
+        summary = analysis['summary']
+        print(f"\n  Gruppi totali:       {summary['total_groups']}")
+        print(f"  File totali:         {summary['total_files']}")
+        print(f"  Dimensione totale:   {summary['total_size_mb']} MB")
+
+        if summary['oldest_date']:
+            print(f"  Data più vecchia:    {summary['oldest_date']}")
+            print(f"  Data più recente:    {summary['newest_date']}")
+
+        print(f"\n  Già archiviati:      {summary['already_archived']}")
+        print(f"  Da archiviare:       {summary['pending_archive']}")
+
+        if summary['by_type']:
+            print(f"\n  Per tipo:")
+            for log_type, info in summary['by_type'].items():
+                print(f"    {log_type}: {info['groups']} gruppi, {info['files']} file, {info['size_mb']} MB")
+
+        if analysis['recommendations']:
+            print(f"\n  Raccomandazioni:")
+            for rec in analysis['recommendations']:
+                print(f"    → {rec}")
+
+        if analysis['pending_groups']:
+            print(f"\n  Log da archiviare (primi 10):")
+            for g in analysis['pending_groups'][:10]:
+                print(f"    {g['date']} - {g['files']} file ({g['size_mb']} MB) [{g['type']}]")
+
+        if analysis['cleanable_groups']:
+            print(f"\n  Log eliminabili localmente (primi 10):")
+            for g in analysis['cleanable_groups'][:10]:
+                print(f"    {g['date']} - {g['files']} file ({g['size_mb']} MB) [{g['type']}]")
+
+        print(f"\n{'=' * 60}")
+
+    def cleanup_local(self, keep_days: int = None, dry_run: bool = False):
+        """Cleanup local Wazuh logs that are already archived"""
+        if keep_days is None:
+            keep_days = self.models['retention'].local.days_keep_local
+
+        logger.info(f"Cleaning local logs (keeping {keep_days} days)...")
+
+        cleaner = WazuhLogsCleaner(
+            self.models['wazuh'],
+            self.models['retention']
+        )
+
+        results = cleaner.clean_archived_logs(
+            self.models['qnap'].mount_point,
+            keep_local_days=keep_days,
+            dry_run=dry_run
+        )
+
+        print(f"\n{'=' * 60}")
+        print(f"Pulizia Log Locali {'(SIMULAZIONE)' if dry_run else ''}")
+        print(f"{'=' * 60}")
+
+        print(f"\n  Gruppi puliti:       {results['groups_cleaned']}")
+        print(f"  File eliminati:      {results['files_deleted']}")
+        print(f"  Spazio liberato:     {results['space_freed_mb']} MB")
+
+        if results['errors']:
+            print(f"\n  Errori ({len(results['errors'])}):")
+            for err in results['errors'][:5]:
+                print(f"    ✗ {err}")
+
+        if results['details']:
+            print(f"\n  Dettagli:")
+            for d in results['details'][:10]:
+                print(f"    {d['date']} - {d['files']} file ({d['size_mb']} MB)")
+
+        print(f"\n{'=' * 60}")
+
+        return results
+
     def check_status(self):
         """Check system status"""
         print("\n" + "=" * 60)
@@ -514,6 +606,8 @@ Comandi disponibili:
   list            Lista gli archivi disponibili
   browse          Visualizza il contenuto di un archivio
   stats           Mostra statistiche degli archivi
+  analyze         Analizza log storici Wazuh
+  cleanup         Pulisce log locali già archiviati su WORM
 
 Esempi:
   wazuh-immutable-store menu                     # Menu interattivo
@@ -528,13 +622,17 @@ Esempi:
   wazuh-immutable-store list --start 2025-01-01 --end 2025-01-31  # Filtra per data
   wazuh-immutable-store browse <nome-archivio>   # Sfoglia contenuto archivio
   wazuh-immutable-store stats                    # Statistiche archivi
+  wazuh-immutable-store analyze                  # Analizza log storici
+  wazuh-immutable-store cleanup --dry-run        # Simula pulizia locale
+  wazuh-immutable-store cleanup --keep-days 7    # Pulisce mantenendo 7 giorni
   wazuh-immutable-store recover --start 2025-01-01 --end 2025-01-31 --output /tmp/recovery
         """
     )
 
     parser.add_argument('command', nargs='?', default='menu',
                         choices=['menu', 'setup', 'archive', 'retention', 'verify',
-                                 'recover', 'list', 'status', 'test', 'browse', 'stats'],
+                                 'recover', 'list', 'status', 'test', 'browse', 'stats',
+                                 'analyze', 'cleanup'],
                         help='Comando da eseguire')
 
     parser.add_argument('-c', '--config', type=Path,
@@ -560,6 +658,9 @@ Esempi:
 
     parser.add_argument('--archive-name', type=str,
                         help='Nome archivio per browse')
+
+    parser.add_argument('--keep-days', type=int,
+                        help='Giorni da mantenere in locale per cleanup')
 
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='Output dettagliato')
@@ -645,6 +746,12 @@ Esempi:
         elif args.command == 'test':
             success = app.test_connection()
             sys.exit(0 if success else 1)
+
+        elif args.command == 'analyze':
+            app.analyze_historical()
+
+        elif args.command == 'cleanup':
+            app.cleanup_local(keep_days=args.keep_days, dry_run=args.dry_run)
 
     except KeyboardInterrupt:
         print("\nOperazione annullata")

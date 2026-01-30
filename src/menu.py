@@ -343,16 +343,37 @@ class InteractiveMenu:
 
         menu.add_item(MenuItem(
             key="2",
-            label="Esegui Retention (dry-run)",
-            action=self._retention_dry_run,
-            description="Simula pulizia senza cancellare"
+            label="Analizza Log Storici Wazuh",
+            action=self._analyze_historical,
+            description="Scansiona log storici e mostra stato archiviazione"
         ))
 
         menu.add_item(MenuItem(
             key="3",
+            label="Pulisci Log Locali (dry-run)",
+            action=self._cleanup_local_dry_run,
+            description="Simula pulizia log già archiviati su WORM"
+        ))
+
+        menu.add_item(MenuItem(
+            key="4",
+            label="Pulisci Log Locali",
+            action=self._cleanup_local_run,
+            description="Elimina log locali già archiviati su WORM"
+        ))
+
+        menu.add_item(MenuItem(
+            key="5",
+            label="Esegui Retention (dry-run)",
+            action=self._retention_dry_run,
+            description="Simula pulizia archivi temp senza cancellare"
+        ))
+
+        menu.add_item(MenuItem(
+            key="6",
             label="Esegui Retention",
             action=self._retention_run,
-            description="Esegue ciclo di pulizia"
+            description="Esegue ciclo di pulizia archivi temp"
         ))
 
         return menu
@@ -789,6 +810,40 @@ class InteractiveMenu:
         if confirm == 's':
             print(f"\n{MenuColors.GREEN}Esecuzione retention...{MenuColors.END}\n")
             self.app.run_retention(dry_run=False)
+        else:
+            print("Operazione annullata")
+
+    def _analyze_historical(self):
+        """Analyze historical Wazuh logs"""
+        print(f"\n{MenuColors.YELLOW}Analisi log storici Wazuh...{MenuColors.END}\n")
+        self.app.analyze_historical()
+
+    def _cleanup_local_dry_run(self):
+        """Run local cleanup in dry-run mode"""
+        print(f"\n{MenuColors.YELLOW}Simulazione pulizia log locali...{MenuColors.END}\n")
+
+        # Ask for days to keep
+        days_input = input("Giorni da mantenere in locale [default: da config]: ").strip()
+        keep_days = int(days_input) if days_input else None
+
+        self.app.cleanup_local(keep_days=keep_days, dry_run=True)
+
+    def _cleanup_local_run(self):
+        """Run actual local cleanup"""
+        print(f"\n{MenuColors.CYAN}=== Pulizia Log Locali ==={MenuColors.END}\n")
+
+        # First show analysis
+        print(f"{MenuColors.YELLOW}Analisi in corso...{MenuColors.END}\n")
+        self.app.analyze_historical()
+
+        # Ask for days to keep
+        days_input = input("\nGiorni da mantenere in locale [default: da config]: ").strip()
+        keep_days = int(days_input) if days_input else None
+
+        confirm = input(f"\n{MenuColors.YELLOW}Confermi l'eliminazione dei log già archiviati? [s/N]: {MenuColors.END}").strip().lower()
+        if confirm == 's':
+            print(f"\n{MenuColors.GREEN}Esecuzione pulizia...{MenuColors.END}\n")
+            self.app.cleanup_local(keep_days=keep_days, dry_run=False)
         else:
             print("Operazione annullata")
 
