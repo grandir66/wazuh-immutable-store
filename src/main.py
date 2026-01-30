@@ -150,8 +150,13 @@ class WazuhImmutableStore:
         self.config = ConfigLoader.load(self.config_path)
         self.models = ConfigLoader.to_models(self.config)
 
-    def run_archive(self, dry_run: bool = False):
-        """Run archive cycle"""
+    def run_archive(self, dry_run: bool = False, auto_cleanup: bool = True):
+        """Run archive cycle with optional automatic local cleanup
+
+        Args:
+            dry_run: If True, simulate without making changes
+            auto_cleanup: If True, cleanup local logs after successful transfer
+        """
         logger.info("Starting archive cycle...")
 
         # Initialize managers with remote mount point for WORM check
@@ -168,6 +173,9 @@ class WazuhImmutableStore:
 
         if not records:
             logger.info("No archives created")
+            # Even if no new archives, still run cleanup for previously archived logs
+            if auto_cleanup and not dry_run:
+                self._auto_cleanup_local()
             return
 
         # Sign archives
@@ -186,6 +194,8 @@ class WazuhImmutableStore:
                 logger.error(f"Failed to sign {record.id}: {e}")
 
         # Transfer to QNAP
+        successful = 0
+        failed = 0
         if not dry_run:
             transfer_manager = TransferManager(
                 self.models['qnap'],
@@ -198,7 +208,38 @@ class WazuhImmutableStore:
             successful, failed = transfer_manager.process_queue()
             logger.info(f"Transfer complete: {successful} successful, {failed} failed")
 
+            # Auto cleanup local logs after successful transfer
+            if auto_cleanup and successful > 0:
+                self._auto_cleanup_local()
+
         logger.info("Archive cycle complete")
+
+    def _auto_cleanup_local(self):
+        """Automatically cleanup local Wazuh logs that have been archived to WORM"""
+        logger.info("Running automatic local cleanup...")
+
+        keep_days = self.models['retention'].local.days_keep_local
+
+        cleaner = WazuhLogsCleaner(
+            self.models['wazuh'],
+            self.models['retention']
+        )
+
+        results = cleaner.clean_archived_logs(
+            self.models['qnap'].mount_point,
+            keep_local_days=keep_days,
+            dry_run=False
+        )
+
+        if results['groups_cleaned'] > 0:
+            logger.info(f"Local cleanup: {results['files_deleted']} files deleted, "
+                       f"{results['space_freed_mb']} MB freed")
+        else:
+            logger.info("Local cleanup: no files to clean")
+
+        if results['errors']:
+            for err in results['errors'][:5]:
+                logger.warning(f"Cleanup error: {err}")
 
     def run_retention(self, dry_run: bool = False):
         """Run retention cycle"""
@@ -615,7 +656,8 @@ Esempi:
   wazuh-immutable-store status                   # Verifica stato
   wazuh-immutable-store test                     # Test connessione NFS
   wazuh-immutable-store archive --dry-run        # Test archiviazione
-  wazuh-immutable-store archive                  # Archiviazione reale
+  wazuh-immutable-store archive                  # Archiviazione + pulizia automatica
+  wazuh-immutable-store archive --no-cleanup     # Solo archiviazione, no pulizia
   wazuh-immutable-store verify                   # Verifica integrità
   wazuh-immutable-store list                     # Lista archivi
   wazuh-immutable-store list --format json       # Lista in JSON
@@ -662,6 +704,9 @@ Esempi:
     parser.add_argument('--keep-days', type=int,
                         help='Giorni da mantenere in locale per cleanup')
 
+    parser.add_argument('--no-cleanup', action='store_true',
+                        help='Disabilita pulizia automatica dopo archiviazione')
+
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='Output dettagliato')
 
@@ -703,7 +748,7 @@ Esempi:
     # Execute command
     try:
         if args.command == 'archive':
-            app.run_archive(dry_run=args.dry_run)
+            app.run_archive(dry_run=args.dry_run, auto_cleanup=not args.no_cleanup)
 
         elif args.command == 'retention':
             app.run_retention(dry_run=args.dry_run)
