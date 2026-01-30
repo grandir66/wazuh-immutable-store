@@ -50,6 +50,16 @@ if ! command -v mount.nfs &> /dev/null; then
     MISSING_PACKAGES="$MISSING_PACKAGES nfs-common"
 fi
 
+# Check for pip3
+if ! command -v pip3 &> /dev/null; then
+    MISSING_PACKAGES="$MISSING_PACKAGES python3-pip"
+fi
+
+# Check for python3-yaml (can be installed via apt instead of pip)
+if ! python3 -c "import yaml" 2>/dev/null; then
+    MISSING_PACKAGES="$MISSING_PACKAGES python3-yaml"
+fi
+
 if [ -n "$MISSING_PACKAGES" ]; then
     echo -e "${YELLOW}Pacchetti mancanti:$MISSING_PACKAGES${NC}"
     read -p "Installare i pacchetti mancanti? [S/n] " response
@@ -61,8 +71,13 @@ if [ -n "$MISSING_PACKAGES" ]; then
     if command -v apt-get &> /dev/null; then
         apt-get update && apt-get install -y $MISSING_PACKAGES
     elif command -v yum &> /dev/null; then
+        # RHEL/CentOS package names differ
+        MISSING_PACKAGES=$(echo "$MISSING_PACKAGES" | sed 's/python3-yaml/python3-pyyaml/g')
+        MISSING_PACKAGES=$(echo "$MISSING_PACKAGES" | sed 's/nfs-common/nfs-utils/g')
         yum install -y $MISSING_PACKAGES
     elif command -v dnf &> /dev/null; then
+        MISSING_PACKAGES=$(echo "$MISSING_PACKAGES" | sed 's/python3-yaml/python3-pyyaml/g')
+        MISSING_PACKAGES=$(echo "$MISSING_PACKAGES" | sed 's/nfs-common/nfs-utils/g')
         dnf install -y $MISSING_PACKAGES
     else
         echo -e "${RED}Package manager non riconosciuto. Installa manualmente:$MISSING_PACKAGES${NC}"
@@ -70,9 +85,18 @@ if [ -n "$MISSING_PACKAGES" ]; then
     fi
 fi
 
-# Install Python dependencies
-echo "Installazione dipendenze Python..."
-pip3 install pyyaml --quiet
+# Verify Python yaml module is available
+echo "Verifica dipendenze Python..."
+if ! python3 -c "import yaml" 2>/dev/null; then
+    echo -e "${YELLOW}Installazione PyYAML via pip...${NC}"
+    if command -v pip3 &> /dev/null; then
+        pip3 install pyyaml --quiet
+    else
+        echo -e "${RED}Errore: impossibile installare PyYAML${NC}"
+        exit 1
+    fi
+fi
+echo -e "  PyYAML: ${GREEN}OK${NC}"
 
 # Create directories
 echo "Creazione directory..."
