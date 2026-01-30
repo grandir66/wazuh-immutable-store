@@ -2,9 +2,14 @@
 """
 Wazuh Immutable Store - Historical Logs Manager
 Gestione dei log storici di Wazuh e pulizia locale
+
+Wazuh log structure:
+  /var/ossec/logs/archives/YYYY/Mon/ossec-archive-DD.log.gz
+  /var/ossec/logs/alerts/YYYY/Mon/ossec-alerts-DD.json.gz
 """
 
 import os
+import re
 import shutil
 import logging
 from datetime import datetime, timedelta
@@ -34,6 +39,18 @@ class HistoricalLogGroup:
 
 class HistoricalLogsScanner:
     """Scans Wazuh directories for historical logs"""
+
+    # Month name mapping
+    MONTHS = {
+        'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4,
+        'may': 5, 'jun': 6, 'jul': 7, 'aug': 8,
+        'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12
+    }
+
+    # Regex patterns for Wazuh log files
+    # ossec-archive-DD.log.gz, ossec-archive-DD.json.gz, ossec-alerts-DD.log.gz, etc.
+    ARCHIVE_PATTERN = re.compile(r'ossec-archive-(\d{2})\.(log|json)(\.gz)?$')
+    ALERT_PATTERN = re.compile(r'ossec-alerts-(\d{2})\.(log|json)(\.gz)?$')
 
     def __init__(self, wazuh_config: WazuhConfig):
         self.config = wazuh_config
@@ -69,11 +86,17 @@ class HistoricalLogsScanner:
 
     def _scan_directory(self, base_path: Path, log_type: str,
                         remote_mount: Optional[Path] = None) -> List[HistoricalLogGroup]:
-        """Scan a Wazuh log directory for date-organized logs"""
-        groups = []
+        """
+        Scan a Wazuh log directory for date-organized logs
 
-        # Wazuh organizes logs as: YYYY/Mon/DD/
-        # Example: 2025/Jan/30/archives.json
+        Wazuh structure: YYYY/Mon/ossec-archive-DD.log.gz
+        Example: 2026/Jan/ossec-archive-30.log.gz
+        """
+        groups = []
+        files_by_date: Dict[datetime, List[Path]] = {}
+
+        # Select pattern based on log type
+        pattern = self.ARCHIVE_PATTERN if log_type == 'archives' else self.ALERT_PATTERN
 
         for year_dir in sorted(base_path.iterdir()):
             if not year_dir.is_dir() or not year_dir.name.isdigit():
@@ -90,53 +113,67 @@ class HistoricalLogsScanner:
                 if month_num == 0:
                     continue
 
-                for day_dir in sorted(month_dir.iterdir()):
-                    if not day_dir.is_dir() or not day_dir.name.isdigit():
+                # Scan files in month directory
+                for file_path in month_dir.iterdir():
+                    if not file_path.is_file():
                         continue
 
-                    day = int(day_dir.name)
+                    # Match log file pattern
+                    match = pattern.match(file_path.name)
+                    if not match:
+                        # Also include .sum files
+                        if file_path.suffix == '.sum':
+                            # Extract day from sum file name
+                            sum_match = re.match(r'ossec-(archive|alerts)-(\d{2})\.(log|json)\.sum$', file_path.name)
+                            if sum_match:
+                                day = int(sum_match.group(2))
+                                try:
+                                    log_date = datetime(year, month_num, day)
+                                    if log_date not in files_by_date:
+                                        files_by_date[log_date] = []
+                                    files_by_date[log_date].append(file_path)
+                                except ValueError:
+                                    continue
+                        continue
+
+                    day = int(match.group(1))
 
                     try:
                         log_date = datetime(year, month_num, day)
                     except ValueError:
                         continue
 
-                    # Collect files in this date directory
-                    files = list(day_dir.glob('*'))
-                    if not files:
-                        continue
+                    if log_date not in files_by_date:
+                        files_by_date[log_date] = []
+                    files_by_date[log_date].append(file_path)
 
-                    total_size = sum(f.stat().st_size for f in files if f.is_file())
-                    file_count = len([f for f in files if f.is_file()])
+        # Create groups from collected files
+        for log_date, files in files_by_date.items():
+            # Calculate total size
+            total_size = sum(f.stat().st_size for f in files if f.exists())
+            file_count = len(files)
 
-                    # Check if already archived on remote
-                    already_archived = False
-                    if remote_mount and remote_mount.exists():
-                        already_archived = self._check_already_archived(
-                            log_date, remote_mount
-                        )
+            # Check if already archived on remote
+            already_archived = False
+            if remote_mount and remote_mount.exists():
+                already_archived = self._check_already_archived(log_date, remote_mount)
 
-                    group = HistoricalLogGroup(
-                        date=log_date,
-                        date_str=log_date.strftime("%Y-%m-%d"),
-                        files=[f for f in files if f.is_file()],
-                        total_size=total_size,
-                        file_count=file_count,
-                        log_type=log_type,
-                        already_archived=already_archived
-                    )
-                    groups.append(group)
+            group = HistoricalLogGroup(
+                date=log_date,
+                date_str=log_date.strftime("%Y-%m-%d"),
+                files=files,
+                total_size=total_size,
+                file_count=file_count,
+                log_type=log_type,
+                already_archived=already_archived
+            )
+            groups.append(group)
 
         return groups
 
     def _parse_month(self, month_name: str) -> int:
         """Parse month name to number"""
-        months = {
-            'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4,
-            'may': 5, 'jun': 6, 'jul': 7, 'aug': 8,
-            'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12
-        }
-        return months.get(month_name.lower()[:3], 0)
+        return self.MONTHS.get(month_name.lower()[:3], 0)
 
     def _check_already_archived(self, log_date: datetime, remote_mount: Path) -> bool:
         """Check if this date's logs are already archived on remote"""
@@ -155,7 +192,7 @@ class HistoricalLogsScanner:
         ]
 
         for pattern in check_paths:
-            if list(pattern.parent.glob(pattern.name)):
+            if pattern.parent.exists() and list(pattern.parent.glob(pattern.name)):
                 return True
 
         return False
@@ -318,8 +355,8 @@ class WazuhLogsCleaner:
 
         current = start_dir
 
-        # Go up to 3 levels (day -> month -> year)
-        for _ in range(3):
+        # Go up to 2 levels (month -> year)
+        for _ in range(2):
             if not current.exists():
                 break
 
