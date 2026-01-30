@@ -394,11 +394,46 @@ class Archiver:
 class ArchiveManager:
     """High-level manager for archive operations"""
 
-    def __init__(self, wazuh_config: WazuhConfig, archive_config: ArchiveConfig):
+    def __init__(self, wazuh_config: WazuhConfig, archive_config: ArchiveConfig,
+                 remote_mount_point: Optional[Path] = None):
         self.collector = LogCollector(wazuh_config)
         self.archiver = Archiver(archive_config)
         self.archive_config = archive_config
         self.records: List[ArchiveRecord] = []
+        self.remote_mount_point = remote_mount_point
+
+    def _check_archive_exists_remote(self, archive_date: datetime) -> bool:
+        """
+        Check if archive for this date already exists on remote WORM storage
+
+        Args:
+            archive_date: Date of the archive to check
+
+        Returns:
+            True if archive already exists
+        """
+        if not self.remote_mount_point or not self.remote_mount_point.exists():
+            return False
+
+        # Generate expected filename
+        archive_name = self.archiver._generate_archive_name(archive_date)
+
+        # Check in date-organized structure (YYYY/MM/)
+        year = archive_date.strftime("%Y")
+        month = archive_date.strftime("%m")
+        remote_path = self.remote_mount_point / year / month / archive_name
+
+        if remote_path.exists():
+            logger.info(f"Archive already exists on WORM: {remote_path}")
+            return True
+
+        # Also check root level
+        root_path = self.remote_mount_point / archive_name
+        if root_path.exists():
+            logger.info(f"Archive already exists on WORM: {root_path}")
+            return True
+
+        return False
 
     def run_archive_cycle(self, min_age_days: int = 1) -> List[ArchiveRecord]:
         """
@@ -427,8 +462,15 @@ class ArchiveManager:
             file_groups = self._group_by_hour(files)
 
         created_records = []
+        skipped_count = 0
 
         for group_date, group_files in file_groups.items():
+            # Check if archive already exists on remote WORM storage
+            if self._check_archive_exists_remote(group_date):
+                logger.info(f"Skipping {group_date}: archive already exists on WORM storage")
+                skipped_count += 1
+                continue
+
             try:
                 record = self.archiver.create_archive(group_files, group_date)
                 created_records.append(record)
@@ -438,6 +480,9 @@ class ArchiveManager:
             except ArchiveError as e:
                 logger.error(f"Failed to create archive for {group_date}: {e}")
                 continue
+
+        if skipped_count > 0:
+            logger.info(f"Skipped {skipped_count} archives (already exist on WORM)")
 
         return created_records
 

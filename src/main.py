@@ -153,10 +153,11 @@ class WazuhImmutableStore:
         """Run archive cycle"""
         logger.info("Starting archive cycle...")
 
-        # Initialize managers
+        # Initialize managers with remote mount point for WORM check
         archive_manager = ArchiveManager(
             self.models['wazuh'],
-            self.models['archive']
+            self.models['archive'],
+            remote_mount_point=self.models['qnap'].mount_point
         )
 
         # Create archives

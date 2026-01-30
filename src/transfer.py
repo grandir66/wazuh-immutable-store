@@ -269,6 +269,14 @@ class ArchiveTransfer:
         try:
             remote_path = self.get_remote_path(record)
 
+            # Check if file already exists on WORM volume (cannot overwrite)
+            if remote_path.exists():
+                logger.info(f"Archive already exists on WORM volume, skipping: {remote_path}")
+                record.remote_path = remote_path
+                record.transferred_at = datetime.now()
+                record.status = ArchiveStatus.COMPLETED
+                return True
+
             # Create remote directory structure
             remote_dir = remote_path.parent
             remote_dir.mkdir(parents=True, exist_ok=True)
