@@ -515,19 +515,11 @@ class ArchiveManager:
         # Generate expected filename
         archive_name = self.archiver._generate_archive_name(archive_date)
 
-        # Check in date-organized structure (YYYY/MM/)
-        year = archive_date.strftime("%Y")
-        month = archive_date.strftime("%m")
-        remote_path = self.remote_mount_point / year / month / archive_name
-
-        if remote_path.exists():
-            logger.info(f"Archive already exists on WORM: {remote_path}")
-            return True
-
-        # Also check root level
-        root_path = self.remote_mount_point / archive_name
-        if root_path.exists():
-            logger.info(f"Archive already exists on WORM: {root_path}")
+        # Filename-based recursive search: archives may live under any
+        # YYYY/MM/ subfolder (organized by transfer date, not by log date).
+        found = next(self.remote_mount_point.rglob(archive_name), None)
+        if found is not None:
+            logger.info(f"Archive already exists on WORM: {found}")
             return True
 
         return False
