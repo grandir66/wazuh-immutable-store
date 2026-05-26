@@ -240,7 +240,20 @@ preflight() {
 
 step_a_ufw() {
   should_run "A" "1" || { SKIPPED+=("A"); return; }
-  log_step "A) UFW firewall"
+  log_step "A) UFW firewall (configurazione interattiva)"
+
+  cat <<EOF
+
+  ${BOLD}${YELLOW}⚠ Attenzione critica:${NC}
+  L'attivazione di UFW con regole sbagliate può ${BOLD}bloccare la tua sessione SSH${NC}.
+  Prima di proseguire, verifica:
+    1. Hai accesso alla console di emergenza? (es. console VM Proxmox / iLO / IPMI)
+    2. Conosci da quale IP/subnet ti stai collegando ora?
+       L'IP attuale visto dal server è: ${BOLD}$(who | awk 'NR==1 {print $5}' | tr -d '()')${NC}
+    3. Hai testato la chiave SSH (apri una nuova sessione PRIMA di proseguire)
+
+EOF
+  ask_yesno "Procedere con configurazione UFW interattiva?" "N" || { SKIPPED+=("A"); return; }
 
   if ! command -v ufw >/dev/null 2>&1; then
     log_info "Installo ufw..."
@@ -252,34 +265,136 @@ step_a_ufw() {
   log_info "Stato attuale UFW: $status"
 
   if [[ "$status" == *"active"* ]]; then
-    log_warn "UFW già attivo. Vuoi ridefinire le regole?"
-    ask_yesno "Procedere con riconfig?" "N" || { SKIPPED+=("A"); return; }
-  else
-    log_warn "Sto per abilitare UFW con regole strette. Se applichi via SSH e le regole sono sbagliate, perdi accesso!"
-    ask_yesno "Procedere?" "Y" || { SKIPPED+=("A"); return; }
+    ask_yesno "UFW già attivo. Resetto e ridefinisco?" "N" || { SKIPPED+=("A"); return; }
   fi
+
+  cat <<EOF
+
+  ${BOLD}═══ Configurazione regole UFW ═══${NC}
+
+  Per ciascun servizio ti chiedo da quale rete/IP deve essere accessibile.
+  Formato accettato:
+    - Singola subnet:   ${CYAN}172.16.0.0/16${NC}
+    - Singolo IP:       ${CYAN}172.16.1.20${NC}
+    - Multipli (CSV):   ${CYAN}172.16.0.0/16,172.17.100.0/24,10.0.0.5${NC}
+    - Tutti (sconsigliato): ${CYAN}any${NC}
+    - Disabilita servizio: ${CYAN}vuoto${NC} (premi solo invio)
+
+EOF
+
+  # SSH
+  echo -e "${BOLD}SSH (porta 22/tcp)${NC} — chi gestisce il server in remoto?"
+  echo "   Default suggerito: subnet di Tailscale gateway (più sicuro di LAN aperta)"
+  local ssh_sources
+  ssh_sources=$(ask_input "Sorgenti SSH" "172.17.100.0/24")
+
+  # Wazuh agent
+  echo
+  echo -e "${BOLD}Wazuh agent (porte 1514+1515)${NC} — da quale rete gli agent inviano eventi?"
+  echo "   Default: LAN del cliente (tutti gli agent ci stanno)"
+  local agent_sources
+  agent_sources=$(ask_input "Sorgenti agent" "172.16.0.0/16")
+
+  # Dashboard
+  echo
+  echo -e "${BOLD}Wazuh Dashboard (porta 443/tcp)${NC} — chi accede alla UI?"
+  echo "   Opzioni comuni: solo operatori Tailscale, o anche IT cliente da LAN"
+  local dash_sources
+  dash_sources=$(ask_input "Sorgenti Dashboard (vuoto = chiuso)" "172.17.100.0/24")
+
+  # Indexer
+  echo
+  echo -e "${BOLD}Wazuh Indexer / OpenSearch (porta 9200/tcp)${NC} — quali integrazioni?"
+  echo "   Default: solo operatori Tailscale + eventuali integrazioni (es. DA-IPAM)"
+  local indexer_sources
+  indexer_sources=$(ask_input "Sorgenti Indexer (vuoto = chiuso)" "172.17.100.0/24")
+
+  # API
+  echo
+  echo -e "${BOLD}Wazuh API (porta 55000/tcp)${NC} — quali integrazioni?"
+  local api_sources
+  api_sources=$(ask_input "Sorgenti API (vuoto = chiuso)" "172.17.100.0/24")
+
+  # Custom extra rules
+  echo
+  echo -e "${BOLD}Regole custom aggiuntive${NC} — vuoi aprire altre porte?"
+  local extra_rules=""
+  if ask_yesno "Aggiungere regole custom?" "N"; then
+    while true; do
+      local proto port src
+      port=$(ask_input "Porta (vuoto per finire)" "")
+      [[ -z "$port" ]] && break
+      proto=$(ask_input "Protocollo (tcp/udp/any)" "tcp")
+      src=$(ask_input "Sorgente (subnet/IP/any)" "172.17.100.0/24")
+      extra_rules+="${port}|${proto}|${src}\n"
+    done
+  fi
+
+  # Conferma riassuntiva
+  echo
+  echo -e "${BOLD}═══ Regole che sto per applicare ═══${NC}"
+  echo "  SSH 22         ← $ssh_sources"
+  echo "  Agent 1514     ← $agent_sources"
+  echo "  Agent 1515     ← $agent_sources"
+  echo "  Dashboard 443  ← ${dash_sources:-CHIUSO}"
+  echo "  Indexer 9200   ← ${indexer_sources:-CHIUSO}"
+  echo "  API 55000      ← ${api_sources:-CHIUSO}"
+  [[ -n "$extra_rules" ]] && { echo "  Extra:"; echo -e "$extra_rules" | sed 's/^/    /'; }
+  echo
+  ask_yesno "${BOLD}Confermi e applico?${NC}" "N" || { SKIPPED+=("A"); return; }
 
   run_or_dry "ufw --force reset"
   run_or_dry "ufw default deny incoming"
   run_or_dry "ufw default allow outgoing"
-  run_or_dry "ufw allow from $LAN_NETWORK to any port 22 proto tcp comment 'SSH LAN'"
-  run_or_dry "ufw allow from $LAN_NETWORK to any port 1514 comment 'Wazuh agent events'"
-  run_or_dry "ufw allow from $LAN_NETWORK to any port 1515 proto tcp comment 'Wazuh enrollment'"
-  run_or_dry "ufw allow from $LAN_NETWORK to any port 443 proto tcp comment 'Dashboard'"
-  if [[ -n "$DA_IPAM_IP" ]]; then
-    run_or_dry "ufw allow from $DA_IPAM_IP to any port 55000 proto tcp comment 'API solo da DA-IPAM'"
-    run_or_dry "ufw allow from $DA_IPAM_IP to any port 9200 proto tcp comment 'Indexer solo da DA-IPAM'"
+
+  apply_ufw_rule() {
+    local sources="$1" port="$2" proto="$3" comment="$4"
+    [[ -z "$sources" ]] && return
+    if [[ "$sources" == "any" ]]; then
+      run_or_dry "ufw allow $port/$proto comment '$comment (open)'"
+      return
+    fi
+    IFS=',' read -ra SRCS <<< "$sources"
+    for src in "${SRCS[@]}"; do
+      src=$(echo "$src" | xargs) # trim
+      [[ -z "$src" ]] && continue
+      if [[ "$proto" == "any" ]]; then
+        run_or_dry "ufw allow from $src to any port $port comment '$comment'"
+      else
+        run_or_dry "ufw allow from $src to any port $port proto $proto comment '$comment'"
+      fi
+    done
+  }
+
+  apply_ufw_rule "$ssh_sources" 22 tcp "SSH"
+  apply_ufw_rule "$agent_sources" 1514 any "Wazuh agent events"
+  apply_ufw_rule "$agent_sources" 1515 tcp "Wazuh enrollment"
+  apply_ufw_rule "$dash_sources" 443 tcp "Dashboard"
+  apply_ufw_rule "$indexer_sources" 9200 tcp "Indexer"
+  apply_ufw_rule "$api_sources" 55000 tcp "API"
+
+  if [[ -n "$extra_rules" ]]; then
+    while IFS='|' read -r port proto src; do
+      [[ -z "$port" ]] && continue
+      apply_ufw_rule "$src" "$port" "$proto" "Custom"
+    done <<< "$(echo -e "$extra_rules")"
   fi
+
   run_or_dry "ufw --force enable"
 
   log_ok "UFW configurato"
-  if [[ "$DRY_RUN" != "yes" ]]; then ufw status verbose | sed 's/^/    /'; fi
+  if [[ "$DRY_RUN" != "yes" ]]; then
+    echo
+    ufw status verbose | sed 's/^/    /'
+    echo
+    log_warn "VERIFICA SUBITO con NUOVA SESSIONE SSH che funzioni ancora prima di chiudere questa"
+  fi
   APPLIED+=("A")
 }
 
 step_b_ssh() {
   should_run "B" "1" || { SKIPPED+=("B"); return; }
-  log_step "B) SSH hardening"
+  log_step "B) SSH hardening (con safeguards anti-lockout)"
 
   local conf="/etc/ssh/sshd_config.d/99-harden.conf"
   if [[ -f "$conf" ]]; then
@@ -287,25 +402,97 @@ step_b_ssh() {
     ask_yesno "Sovrascrivere?" "N" || { SKIPPED+=("B"); return; }
   fi
 
-  log_warn "Sto per disabilitare PasswordAuthentication, root login, e tightening generale di SSH."
-  log_warn "Utente abilitato: $SSH_USER (verificato presenza chiave pubblica nel preflight)"
-  ask_yesno "Procedere?" "Y" || { SKIPPED+=("B"); return; }
+  # =============== PRE-CHECK ANTI-LOCKOUT ===============
+  cat <<EOF
 
+  ${RED}${BOLD}╔══════════════════════════════════════════════════════════════╗${NC}
+  ${RED}${BOLD}║         ATTENZIONE — RISCHIO LOCKOUT SSH                     ║${NC}
+  ${RED}${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}
+
+  L'hardening SSH può escluderti dal server se applicato senza precauzioni.
+  Verifico la situazione attuale prima di procedere.
+
+EOF
+
+  # Conta chiavi pubbliche dell'utente
+  local key_count
+  key_count=$(grep -c "^ssh-" "/home/$SSH_USER/.ssh/authorized_keys" 2>/dev/null || echo 0)
+  echo "  Utente target: ${BOLD}$SSH_USER${NC}"
+  echo "  Chiavi SSH autorizzate: ${BOLD}$key_count${NC}"
+  if [[ -f "/home/$SSH_USER/.ssh/authorized_keys" ]]; then
+    awk '/^ssh-/{print "    - "$NF}' "/home/$SSH_USER/.ssh/authorized_keys"
+  fi
+  echo
+
+  if [[ $key_count -lt 2 ]]; then
+    cat <<EOF
+  ${YELLOW}${BOLD}⚠ Hai solo $key_count chiave SSH autorizzata${NC} = single point of failure.
+  Se la chiave del Mac/client primario si rompe (HD failure, smarrimento), perdi accesso.
+
+  Opzioni di mitigazione consigliate (in ordine):
+
+  ${BOLD}1. AGGIUNGI UNA SECONDA CHIAVE${NC} (raccomandato)
+     Posso generare ora una nuova keypair come "backup key":
+     - Privata cifrata con passphrase forte → in vault aziendale + cassaforte
+     - Pubblica autorizzata su questo server
+     Risultato: 2 chiavi indipendenti, una di emergenza
+
+  ${BOLD}2. VERIFICA CONSOLE EMERGENCY${NC} (Proxmox/iLO/IPMI)
+     Console fisica/web della VM resta accessibile anche se SSH è chiuso.
+     Devi essere sicuro di poterla raggiungere in caso di lockout.
+
+  ${BOLD}3. MANTIENI PasswordAuth limitato${NC} (compromesso)
+     Invece di disabilitare totalmente PasswordAuthentication, lo limito
+     SOLO ad una subnet di trust (es. Tailscale gateway) via Match Address.
+     Brute force impossibile da Internet, ma fallback password disponibile.
+
+EOF
+    local lockout_choice
+    PS3="Scelta [1-4]: "
+    select lockout_choice in \
+      "Genera seconda chiave SSH ora + procedi con disable PasswordAuth" \
+      "Procedi con Match Address (PasswordAuth solo da subnet sicura)" \
+      "Procedi senza precauzioni (ho console Proxmox come fallback)" \
+      "Annulla, applicherò SSH hardening dopo aver risolto"; do
+      case "$REPLY" in
+        1) generate_backup_ssh_key; break ;;
+        2) STEP_B_MODE="match"; break ;;
+        3) STEP_B_MODE="disable"; break ;;
+        4) SKIPPED+=("B"); return ;;
+        *) echo "Scelta non valida" ;;
+      esac
+    done
+  else
+    log_ok "Hai $key_count chiavi SSH ridondate, rischio lockout basso"
+    STEP_B_MODE="disable"
+  fi
+
+  # Chiedi subnet per Match Address se serve
+  local match_subnet=""
+  if [[ "${STEP_B_MODE:-}" == "match" ]]; then
+    match_subnet=$(ask_input "Subnet/IP da cui ammettere PasswordAuth" "172.17.100.0/24")
+  fi
+
+  # =============== APPLICA CONFIG ===============
+  log_info "Backup sshd_config attuale..."
   backup_file "/etc/ssh/sshd_config"
+  for f in /etc/ssh/sshd_config.d/*.conf; do
+    [[ -f "$f" ]] && backup_file "$f"
+  done
+
   if [[ "$DRY_RUN" == "yes" ]]; then
-    log_dry "scrittura $conf"
+    log_dry "scrittura $conf con mode=${STEP_B_MODE:-disable} match=$match_subnet"
   else
     cat > "$conf" <<EOF
 # Hardening generato da harden-wazuh.sh il $STAMP
 PermitRootLogin no
-PasswordAuthentication no
 PermitEmptyPasswords no
 ChallengeResponseAuthentication no
 KbdInteractiveAuthentication no
 PubkeyAuthentication yes
 AllowUsers $SSH_USER
 MaxAuthTries 3
-LoginGraceTime 30
+LoginGraceTime 60
 ClientAliveInterval 300
 ClientAliveCountMax 2
 X11Forwarding no
@@ -316,9 +503,35 @@ GatewayPorts no
 PrintMotd no
 Banner /etc/ssh/banner
 EOF
-    cat > /etc/ssh/banner <<EOF
+
+    if [[ "${STEP_B_MODE:-disable}" == "match" ]] && [[ -n "$match_subnet" ]]; then
+      cat >> "$conf" <<EOF
+
+# Default: solo public key auth
+PasswordAuthentication no
+
+# Eccezione: PasswordAuth permessa SOLO da subnet di trust (Match Address)
+Match Address $match_subnet
+    PasswordAuthentication yes
+    MaxAuthTries 2
+EOF
+    else
+      cat >> "$conf" <<EOF
+PasswordAuthentication no
+EOF
+    fi
+
+    # Disabilita config cloud-init che mette PasswordAuth yes
+    if [[ -f /etc/ssh/sshd_config.d/50-cloud-init.conf ]]; then
+      if grep -q "PasswordAuthentication" /etc/ssh/sshd_config.d/50-cloud-init.conf; then
+        log_warn "Disabilito PasswordAuthentication yes in 50-cloud-init.conf"
+        sed -i 's|^PasswordAuthentication yes|#PasswordAuthentication yes  # disabled by harden-wazuh.sh|' /etc/ssh/sshd_config.d/50-cloud-init.conf
+      fi
+    fi
+
+    cat > /etc/ssh/banner <<'EOF'
 *****************************************************************
-ATTENZIONE: accesso autorizzato esclusivamente a personale Domarc.
+ATTENZIONE: accesso autorizzato esclusivamente a personale autorizzato.
 Ogni attivita' viene tracciata e analizzata.
 Accessi non autorizzati saranno perseguiti a termini di legge.
 *****************************************************************
@@ -333,12 +546,59 @@ EOF
     return
   fi
 
-  log_info "Restart sshd (la TUA sessione attuale resta attiva)..."
+  log_warn "Sto per restartare sshd. La tua sessione corrente resta attiva."
+  log_warn "Apri SUBITO una NUOVA sessione SSH per verificare che la chiave funzioni."
+  log_warn "Se la nuova sessione fallisce, NON chiudere questa: rollback con:"
+  echo -e "    ${CYAN}sudo cp /etc/ssh/sshd_config.pre-harden-$STAMP /etc/ssh/sshd_config && sudo systemctl restart ssh${NC}"
+  ask_yesno "Restart sshd ora?" "Y" || { SKIPPED+=("B"); return; }
   run_or_dry "systemctl restart ssh"
 
-  log_ok "SSH hardening applicato"
-  log_warn "Apri una NUOVA sessione SSH PRIMA di chiudere questa, per verificare che la chiave funzioni!"
+  log_ok "SSH hardening applicato (mode=${STEP_B_MODE:-disable})"
   APPLIED+=("B")
+}
+
+generate_backup_ssh_key() {
+  log_info "Genero seconda chiave SSH ridondata..."
+  local stamp; stamp=$(date +%Y%m%d-%H%M%S)
+  local key_path="/root/ssh-backup-key-$stamp"
+
+  if [[ "$DRY_RUN" == "yes" ]]; then
+    log_dry "ssh-keygen + autorizzazione sul server"
+    return
+  fi
+
+  # Genera passphrase forte
+  local passphrase; passphrase=$(openssl rand -base64 32 | tr -d '/+=' | head -c 28)
+
+  ssh-keygen -t ed25519 -f "$key_path" -N "$passphrase" -C "wazuh-emergency-backup-$stamp" >/dev/null
+  cat "${key_path}.pub" >> "/home/$SSH_USER/.ssh/authorized_keys"
+  chown "$SSH_USER:$SSH_USER" "/home/$SSH_USER/.ssh/authorized_keys"
+  chmod 600 "/home/$SSH_USER/.ssh/authorized_keys"
+
+  cat <<EOF
+
+  ${BOLD}${YELLOW}╔══════════════════════════════════════════════════════════════╗${NC}
+  ${BOLD}${YELLOW}║   CHIAVE SSH EMERGENCY GENERATA — SALVA IN VAULT             ║${NC}
+  ${BOLD}${YELLOW}╚══════════════════════════════════════════════════════════════╝${NC}
+
+  Privata: ${BOLD}${key_path}${NC}  (cifrata con passphrase)
+  Pubblica: ${BOLD}${key_path}.pub${NC}  (già aggiunta a authorized_keys di $SSH_USER)
+
+  Passphrase: ${BOLD}$passphrase${NC}
+
+  AZIONI OBBLIGATORIE:
+    1. Trasferisci ${key_path} sul tuo Mac/laptop ammin:
+       ${CYAN}scp $SSH_USER@<server>:${key_path} ~/.ssh/wazuh-emergency-key${NC}
+       ${CYAN}scp $SSH_USER@<server>:${key_path}.pub ~/.ssh/wazuh-emergency-key.pub${NC}
+    2. Salva la passphrase in vault aziendale (1Password / Bitwarden / cassaforte)
+    3. Cancella la chiave privata dal server dopo trasferimento sicuro:
+       ${CYAN}sudo shred -u ${key_path} ${key_path}.pub${NC}
+    4. Test della chiave da remoto:
+       ${CYAN}ssh -i ~/.ssh/wazuh-emergency-key $SSH_USER@<server>${NC}
+
+EOF
+  read -r -p "Premi INVIO solo dopo aver trasferito la chiave e salvato la passphrase..."
+  STEP_B_MODE="disable"
 }
 
 step_c_unattended() {

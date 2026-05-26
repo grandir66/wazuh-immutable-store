@@ -17,6 +17,78 @@
 
 ---
 
+## 0. Decisioni operative pre-hardening
+
+Gli step A (firewall) e B (SSH) sono **i più rischiosi** dell'intero processo: applicati senza precauzioni, possono causare il **lockout completo** dal server. Prima di eseguirli, è obbligatorio rispondere alle 4 domande seguenti.
+
+### Domanda 1 — Hai un canale di accesso di emergenza fuori da SSH?
+
+Devi sapere come entrare nel server se SSH smette di funzionare. Opzioni:
+
+| Canale emergency | Come usarlo |
+|---|---|
+| **Console VM Proxmox** (se il server è virtualizzato) | Login web UI Proxmox del cliente → seleziona VM → tab Console → noVNC/spice |
+| **iLO/iDRAC/IPMI** (server fisico HP/Dell/Supermicro) | Connessione out-of-band sul management port dedicato |
+| **Console fisica** (server on-prem) | Tastiera+monitor sull'host fisico |
+| **Bastion host alternativo** | SSH a un secondo server della stessa LAN, da cui poi raggiungere il Wazuh |
+
+Se nessuno è disponibile o accessibile, **non applicare lo step B** in modalità "disable" (vai con "match address").
+
+### Domanda 2 — Quante chiavi SSH autorizzate ci sono per l'utente sudo?
+
+Verifica:
+
+```bash
+grep -c '^ssh-' /home/<UTENTE>/.ssh/authorized_keys
+```
+
+- **1 sola chiave** = single point of failure. Se il dispositivo che la ospita si rompe, sei fuori. Genera una seconda "break glass key" prima di procedere (lo script `harden-wazuh.sh` offre l'opzione automatica con backup AES-256 in vault).
+- **2+ chiavi indipendenti** = OK, puoi procedere con disable totale di PasswordAuth.
+
+### Domanda 3 — Da quale IP/subnet ti stai collegando?
+
+L'IP visto dal server determina quali subnet devi consentire nelle regole UFW per non bloccarti. Verifica:
+
+```bash
+who | awk 'NR==1 {print $5}' | tr -d '()'
+# oppure:
+ss -tnp state established 'sport = :22'
+```
+
+Casi comuni:
+
+- IP nella **LAN dello stesso cliente** (`172.16.x.x` se quello è il subnet) → `ufw allow from 172.16.0.0/16 to any port 22 proto tcp`
+- IP del **subnet router Tailscale** (`100.64.x.x` o NAT interno tipo `172.17.100.x`) → `ufw allow from 172.17.100.0/24 to any port 22 proto tcp`
+- **Mai chiudere SSH** prima di aver mappato il tuo IP attuale di accesso.
+
+### Domanda 4 — Vuoi PasswordAuth disabilitata totalmente o limitata?
+
+Tre modi di gestire PasswordAuthentication:
+
+| Modalità | Sicurezza | Resilienza | Raccomandato per |
+|---|---|---|---|
+| **Disable totale** (`PasswordAuthentication no`) | ★★★ | ★ (solo chiave) | Ambienti con 2+ chiavi e console emergency confermata |
+| **Match Address** (password OK solo da subnet di trust) | ★★ | ★★★ | Ambienti operativi (Domarc IT) con singola chiave, fallback comodo |
+| **Lasciare yes con MaxAuthTries 3 + fail2ban aggressive** | ★ | ★★★ | Solo se non puoi cambiare nulla, ma combinato con fail2ban è accettabile |
+
+Lo script `harden-wazuh.sh` ora chiede esplicitamente quale modalità preferisci e offre la generazione automatica della chiave backup.
+
+### Pre-flight checklist (obbligatorio prima di applicare A o B)
+
+- [ ] Console emergency identificata e accessibile (Proxmox/iLO/IPMI/altro)
+- [ ] Almeno una **NUOVA** sessione SSH aperta da test parallelo (per verificare config sshd dopo restart senza chiudere quella corrente)
+- [ ] IP/subnet di provenienza identificato e annotato
+- [ ] Chiavi SSH autorizzate contate (≥1 verificato funzionante)
+- [ ] Se PasswordAuth viene disabilitata: 2+ chiavi presenti, oppure console emergency confermata
+- [ ] Hai a portata di mano i comandi di rollback (anche scritti su carta):
+  ```bash
+  sudo cp /etc/ssh/sshd_config.pre-harden-* /etc/ssh/sshd_config
+  sudo systemctl restart ssh
+  sudo ufw disable
+  ```
+
+---
+
 ## 1. Principi guida
 
 - **Minimizzazione della superficie d'attacco**: disabilita tutto ciò che non serve. Un servizio in ascolto inutilizzato è una porta d'ingresso potenziale.
