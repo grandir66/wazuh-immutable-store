@@ -97,34 +97,67 @@ Sistema di archiviazione immutabile per log Wazuh su QNAP NAS con supporto WORM 
 
 ## Installazione
 
-### 1. Clona il repository
+### Modo raccomandato — Install Wizard (interattivo, 5-10 min)
 
 ```bash
 git clone https://github.com/grandir66/wazuh-immutable-store.git
 cd wazuh-immutable-store
+sudo bash scripts/install-wizard.sh
 ```
 
-### 2. Esegui l'installer
+Il wizard richiede solo **2 input**: IP del NAS + path della NFS share. Tutto il resto viene configurato automaticamente con default sensati (modificabili in seguito via `maintenance.sh`):
+
+- Mount NFS persistente in `/etc/fstab`
+- Pacchetto Python in `/opt/wazuh-immutable-store/`
+- Chiave GPG RSA 4096 dedicata + backup cifrato AES-256
+- Certificato di revoca pre-generato
+- Timer systemd: archive orario + retention giornaliera + verify settimanale
+- Rolling hash chain ogni 5 minuti (composite head/tail/size)
+- Prima esecuzione + verifica end-to-end
+
+Per uso non-interattivo (CI/automation):
+
+```bash
+sudo bash scripts/install-wizard.sh --non-interactive \
+    --qnap-host 192.168.1.100 \
+    --qnap-share /wazuh-archive
+```
+
+### Manutenzione interattiva
+
+Dopo l'installazione, gestione completa via menu interattivo:
+
+```bash
+sudo bash scripts/maintenance.sh
+```
+
+Funzioni disponibili nel menu:
+1. Stato del sistema (health check completo)
+2. Configurazione (retention, schedule, compressione, cambio NAS)
+3. Gestione chiavi GPG (info, export, rotazione, revoca, backup cifrato)
+4. Archive manuale (dry-run o run reale)
+5. Verifica integrità (manifest archive, rolling chain, test WORM)
+6. Recovery / Browse / Search archivi
+7. Manutenzione storage (cleanup, espansione share, rotation Wazuh)
+8. Diagnostica (NFS, GPG, disco, Wazuh, journal)
+9. Esportazione report / informazioni sistema (Markdown, CSV, backup completo)
+
+### Documentazione per cliente / auditor
+
+- [`docs/IMMUTABILITY-LOGIC.md`](docs/IMMUTABILITY-LOGIC.md) — Spiegazione concettuale completa della logica di gestione dell'immutabilità (4 livelli di difesa, garanzie crittografiche, pipeline operativa, mappatura compliance). Documento da fornire a clienti, auditor e responsabili sicurezza.
+
+### Modo legacy — Install base (senza wizard)
+
+Se preferisci configurazione manuale post-install:
 
 ```bash
 sudo ./scripts/install.sh
-```
-
-L'installer:
-- Verifica e installa le dipendenze mancanti
-- Copia i file in `/opt/wazuh-immutable-store/`
-- Installa i servizi systemd
-- Crea le directory necessarie
-
-### 3. Esegui il wizard di configurazione
-
-```bash
 sudo wazuh-immutable-store setup
 ```
 
-Il wizard ti guiderà nella configurazione di:
+Il setup classico ti guiderà manualmente in:
 - Percorsi log Wazuh
-- Connessione NFS al QNAP
+- Connessione NFS al NAS
 - Algoritmo di compressione
 - Firma GPG (opzionale ma consigliata)
 - Policy di retention
