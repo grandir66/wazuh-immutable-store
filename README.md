@@ -142,9 +142,23 @@ Funzioni disponibili nel menu:
 8. Diagnostica (NFS, GPG, disco, Wazuh, journal)
 9. Esportazione report / informazioni sistema (Markdown, CSV, backup completo)
 
+### Hardening del server Wazuh
+
+Script idempotente e documento di accompagnamento per l'hardening del server che ospita Wazuh:
+
+```bash
+sudo bash scripts/harden-wazuh.sh                # interattivo, applica Layer 1+2
+sudo bash scripts/harden-wazuh.sh --dry-run      # mostra cosa farebbe, no modifiche
+sudo bash scripts/harden-wazuh.sh --only layer1  # solo quick wins (UFW, SSH, NTP, fail2ban, patches)
+sudo bash scripts/harden-wazuh.sh --only layer2  # solo standard (sysctl, mount, auditd, AIDE, FIM, PAM)
+```
+
+Lo script applica con prompt di conferma e backup automatico dei file modificati. Vedi [`docs/HARDENING.md`](docs/HARDENING.md) per la checklist narrativa con mappatura CIS / DISA STIG e procedure di verifica indipendente per auditor.
+
 ### Documentazione per cliente / auditor
 
 - [`docs/IMMUTABILITY-LOGIC.md`](docs/IMMUTABILITY-LOGIC.md) — Spiegazione concettuale completa della logica di gestione dell'immutabilità (4 livelli di difesa, garanzie crittografiche, pipeline operativa, mappatura compliance). Documento da fornire a clienti, auditor e responsabili sicurezza.
+- [`docs/HARDENING.md`](docs/HARDENING.md) — Checklist di hardening del server con compliance mapping e procedure di verifica indipendente.
 
 ### Modo legacy — Install base (senza wizard)
 

@@ -113,10 +113,11 @@ main_menu() {
   ${BOLD}7)${NC}  Manutenzione storage (cleanup, espansione share, rotation Wazuh)
   ${BOLD}8)${NC}  Diagnostica (NFS, GPG, disco, Wazuh, journal)
   ${BOLD}9)${NC}  Esporta report / informazioni sistema
+  ${BOLD}H)${NC}  Hardening server (lancia harden-wazuh.sh)
   ${BOLD}0)${NC}  Esci
 
 MENU
-    read -r -p "$(echo -e "${BOLD}>>> Seleziona [0-9]: ${NC}")" choice
+    read -r -p "$(echo -e "${BOLD}>>> Seleziona [0-9,H]: ${NC}")" choice
     case "$choice" in
       1) menu_status ;;
       2) menu_config ;;
@@ -127,10 +128,149 @@ MENU
       7) menu_maintenance ;;
       8) menu_diagnostics ;;
       9) menu_export ;;
+      H|h) menu_hardening ;;
       0) clear; log_info "Bye."; exit 0 ;;
       *) log_warn "Opzione non valida"; sleep 1 ;;
     esac
   done
+}
+
+# ========================================================================
+# H. HARDENING
+# ========================================================================
+menu_hardening() {
+  while true; do
+    banner
+    cat <<EOF
+
+  ${BOLD}═══ Hardening server ═══${NC}
+
+  Riferimenti:
+    ${DIM}docs/HARDENING.md${NC}     — Checklist completa con compliance mapping
+    ${DIM}scripts/harden-wazuh.sh${NC} — Script idempotente Layer 1+2
+
+  ${BOLD}1)${NC}  Esegui hardening completo (Layer 1+2, interattivo)
+  ${BOLD}2)${NC}  Esegui solo Layer 1 (quick wins: UFW, SSH, NTP, fail2ban, patches)
+  ${BOLD}3)${NC}  Esegui solo Layer 2 (sysctl, mount, auditd, AIDE, FIM, PAM)
+  ${BOLD}4)${NC}  Dry-run (mostra cosa farebbe, non applica)
+  ${BOLD}5)${NC}  Stato hardening corrente (auto-check)
+  ${BOLD}6)${NC}  Visualizza HARDENING.md (less)
+  ${BOLD}0)${NC}  Torna al menu principale
+
+EOF
+    read -r -p ">>> [0-6]: " c
+    local script="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/harden-wazuh.sh"
+    [[ -x "$script" ]] || script="/opt/wazuh-immutable-store-scripts/harden-wazuh.sh"
+    case "$c" in
+      1) [[ -x "$script" ]] && bash "$script" || log_error "harden-wazuh.sh non trovato"; press_enter ;;
+      2) [[ -x "$script" ]] && bash "$script" --only layer1 || log_error "harden-wazuh.sh non trovato"; press_enter ;;
+      3) [[ -x "$script" ]] && bash "$script" --only layer2 || log_error "harden-wazuh.sh non trovato"; press_enter ;;
+      4) [[ -x "$script" ]] && bash "$script" --dry-run || log_error "harden-wazuh.sh non trovato"; press_enter ;;
+      5) hardening_status ;;
+      6) less "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../docs/HARDENING.md" 2>/dev/null \
+         || less /opt/wazuh-immutable-store-docs/HARDENING.md 2>/dev/null \
+         || log_error "HARDENING.md non trovato (cerca in scripts/../docs/)" ;;
+      0) return ;;
+      *) sleep 1 ;;
+    esac
+  done
+}
+
+hardening_status() {
+  banner
+  echo -e "${BOLD}═══ Stato hardening corrente (auto-check) ═══${NC}\n"
+
+  local pass=0 fail=0
+
+  echo -e "${BOLD}A) UFW firewall:${NC}"
+  if ufw status 2>/dev/null | head -1 | grep -q "active"; then
+    log_ok "ATTIVO"; pass=$((pass+1))
+  else
+    log_warn "DISATTIVO o non installato"; fail=$((fail+1))
+  fi
+
+  echo -e "\n${BOLD}B) SSH hardening:${NC}"
+  if [[ -f /etc/ssh/sshd_config.d/99-harden.conf ]]; then
+    log_ok "config 99-harden.conf presente"
+    sshd -T 2>/dev/null | grep -E "permitrootlogin|passwordauthentication|maxauthtries" | sed 's/^/    /'
+    pass=$((pass+1))
+  else
+    log_warn "config 99-harden.conf NON presente"; fail=$((fail+1))
+  fi
+
+  echo -e "\n${BOLD}C) Unattended-upgrades:${NC}"
+  if systemctl is-enabled unattended-upgrades 2>/dev/null | grep -q enabled; then
+    log_ok "ATTIVO"; pass=$((pass+1))
+  else
+    log_warn "NON attivo"; fail=$((fail+1))
+  fi
+
+  echo -e "\n${BOLD}D) fail2ban:${NC}"
+  if systemctl is-active fail2ban 2>/dev/null | grep -q active; then
+    log_ok "ATTIVO"; pass=$((pass+1))
+    fail2ban-client status sshd 2>/dev/null | grep -E "Currently|Banned" | sed 's/^/    /' || true
+  else
+    log_warn "NON attivo"; fail=$((fail+1))
+  fi
+
+  echo -e "\n${BOLD}E) NTP chrony:${NC}"
+  if chronyc tracking 2>/dev/null | grep -q "Leap status.*Normal"; then
+    log_ok "Sync OK"; pass=$((pass+1))
+  else
+    log_warn "Non sincronizzato o non installato"; fail=$((fail+1))
+  fi
+
+  echo -e "\n${BOLD}F) Sysctl hardening:${NC}"
+  if [[ -f /etc/sysctl.d/99-wazuh-hardening.conf ]]; then
+    log_ok "config 99-wazuh-hardening.conf presente"
+    sysctl -n kernel.randomize_va_space kernel.kptr_restrict fs.suid_dumpable 2>/dev/null | paste -d= - <(echo -e "randomize_va_space\nkptr_restrict\nsuid_dumpable") | sed 's/^/    /'
+    pass=$((pass+1))
+  else
+    log_warn "config sysctl NON presente"; fail=$((fail+1))
+  fi
+
+  echo -e "\n${BOLD}G) Mount options /tmp:${NC}"
+  if mount | grep '/tmp ' | grep -q noexec; then
+    log_ok "/tmp con noexec,nosuid,nodev"; pass=$((pass+1))
+  else
+    log_warn "/tmp SENZA noexec"; fail=$((fail+1))
+  fi
+
+  echo -e "\n${BOLD}H) Auditd con watch:${NC}"
+  if auditctl -l 2>/dev/null | grep -q gpg_key_access; then
+    log_ok "watch gpg_key_access attivo"; pass=$((pass+1))
+  else
+    log_warn "watch GPG NON attivo"; fail=$((fail+1))
+  fi
+
+  echo -e "\n${BOLD}I) AIDE:${NC}"
+  if [[ -f /var/lib/aide/aide.db ]]; then
+    log_ok "database AIDE presente ($(du -h /var/lib/aide/aide.db | cut -f1))"; pass=$((pass+1))
+  else
+    log_warn "AIDE non inizializzato"; fail=$((fail+1))
+  fi
+
+  echo -e "\n${BOLD}J) Wazuh FIM self-monitoring:${NC}"
+  if grep -q "/root/.gnupg" /var/ossec/etc/ossec.conf 2>/dev/null; then
+    log_ok "FIM su /root/.gnupg configurato"; pass=$((pass+1))
+  else
+    log_warn "FIM self-monitoring NON configurato"; fail=$((fail+1))
+  fi
+
+  echo -e "\n${BOLD}L) PAM lockout:${NC}"
+  if grep -q faillock /etc/pam.d/common-auth 2>/dev/null; then
+    log_ok "pam_faillock configurato"; pass=$((pass+1))
+  else
+    log_warn "pam_faillock NON configurato"; fail=$((fail+1))
+  fi
+
+  echo
+  echo "════════════════════════════════════════════════"
+  echo -e "  Risultato: ${GREEN}$pass passati${NC} / ${RED}$fail mancanti${NC} su 11 check"
+  if [[ $fail -gt 0 ]]; then
+    echo -e "  Esegui: ${CYAN}sudo bash $(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/harden-wazuh.sh${NC}"
+  fi
+  press_enter
 }
 
 # ========================================================================
