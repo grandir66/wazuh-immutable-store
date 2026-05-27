@@ -114,10 +114,11 @@ main_menu() {
   ${BOLD}8)${NC}  Diagnostica (NFS, GPG, disco, Wazuh, journal)
   ${BOLD}9)${NC}  Esporta report / informazioni sistema
   ${BOLD}H)${NC}  Hardening server (lancia harden-wazuh.sh)
+  ${BOLD}I)${NC}  Indexer OpenSearch (ISM policy, indici, cluster)
   ${BOLD}0)${NC}  Esci
 
 MENU
-    read -r -p "$(echo -e "${BOLD}>>> Seleziona [0-9,H]: ${NC}")" choice
+    read -r -p "$(echo -e "${BOLD}>>> Seleziona [0-9,H,I]: ${NC}")" choice
     case "$choice" in
       1) menu_status ;;
       2) menu_config ;;
@@ -129,6 +130,7 @@ MENU
       8) menu_diagnostics ;;
       9) menu_export ;;
       H|h) menu_hardening ;;
+      I|i) menu_indexer ;;
       0) clear; log_info "Bye."; exit 0 ;;
       *) log_warn "Opzione non valida"; sleep 1 ;;
     esac
@@ -873,16 +875,20 @@ menu_maintenance() {
 
   ${BOLD}═══ Manutenzione storage ═══${NC}
 
-  ${BOLD}1)${NC}  Cleanup archivi locali oltre retention
+  ${BOLD}1)${NC}  Cleanup archivi locali oltre retention (wazuh-immutable-store)
   ${BOLD}2)${NC}  Forza rotation file live Wazuh (stop + mv + restart)
   ${BOLD}3)${NC}  Mostra istruzioni espansione share NAS
   ${BOLD}4)${NC}  Reset rolling manifest (cancella e ricrea)
   ${BOLD}5)${NC}  Restart timer (immutable + rolling)
   ${BOLD}6)${NC}  Disabilita logall (riduce ~40% volume)
+  ${DIM}— Cleanup sistema (avanzato) —${NC}
+  ${BOLD}7)${NC}  Cleanup Wazuh logs locali >N giorni (.gz già su WORM)
+  ${BOLD}8)${NC}  Journald vacuum (cap a N MB + config persistente)
+  ${BOLD}9)${NC}  Setup logrotate per syslog remoto (Mikrotik etc.)
   ${BOLD}0)${NC}  Torna
 
 EOF
-    read -r -p ">>> [0-6]: " c
+    read -r -p ">>> [0-9]: " c
     case "$c" in
       1) wazuh-immutable-store retention 2>&1 | tail -20; press_enter ;;
       2) maint_rotate_wazuh ;;
@@ -890,10 +896,163 @@ EOF
       4) maint_reset_manifest ;;
       5) systemctl restart wazuh-immutable-store.timer wazuh-rolling-hash.timer; log_ok "Timer riavviati"; press_enter ;;
       6) maint_disable_logall ;;
+      7) maint_cleanup_wazuh_old_logs ;;
+      8) maint_journald_vacuum ;;
+      9) maint_remote_syslog_logrotate ;;
       0) return ;;
       *) sleep 1 ;;
     esac
   done
+}
+
+maint_cleanup_wazuh_old_logs() {
+  cat <<EOF
+
+  ${BOLD}═══ Cleanup Wazuh logs locali >N giorni ═══${NC}
+
+  Cancella i file .gz e .sum in /var/ossec/logs/{archives,alerts}/ più
+  vecchi di N giorni. SICURO solo se i log sono già su WORM (default sì,
+  se wazuh-immutable-store ha girato regolarmente).
+
+EOF
+  local days; days=$(ask_yesno "Verificare prima la copertura WORM?" "Y" && echo "verify" || echo "skip")
+  read -r -p "Cancella file più vecchi di quanti giorni? [30]: " n
+  n="${n:-30}"
+  [[ "$n" =~ ^[0-9]+$ ]] || { log_error "N giorni deve essere un numero"; press_enter; return; }
+
+  echo
+  echo "── Inventario pre-cleanup ──"
+  local count_gz count_sum size_before
+  count_gz=$(find /var/ossec/logs/archives /var/ossec/logs/alerts -name "*.gz" -mtime +$n 2>/dev/null | wc -l)
+  count_sum=$(find /var/ossec/logs/archives /var/ossec/logs/alerts -name "*.sum" -mtime +$n 2>/dev/null | wc -l)
+  size_before=$(find /var/ossec/logs/archives /var/ossec/logs/alerts -name "*.gz" -mtime +$n -exec du -cb {} + 2>/dev/null | tail -1 | awk '{print $1}')
+  echo "  File .gz da cancellare: $count_gz"
+  echo "  File .sum da cancellare: $count_sum"
+  echo "  Spazio stimato: $(numfmt --to=iec-i --suffix=B ${size_before:-0})"
+  echo
+  echo "  Sample:"
+  find /var/ossec/logs/archives /var/ossec/logs/alerts -name "*.gz" -mtime +$n 2>/dev/null | head -3 | sed 's/^/    /'
+
+  if [[ "$days" == "verify" ]]; then
+    echo
+    echo "── Verifica copertura WORM ──"
+    local mp; mp=$(get_config mount_point); mp=${mp:-/mnt/qnap-wazuh}
+    local worm_oldest worm_newest
+    worm_oldest=$(find "$mp" -name "wazuh-logs-*.tar.gz" -not -name "*.sig" -not -name "*.sha256" 2>/dev/null | sort | head -1 | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | head -1)
+    worm_newest=$(find "$mp" -name "wazuh-logs-*.tar.gz" -not -name "*.sig" -not -name "*.sha256" 2>/dev/null | sort | tail -1 | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | head -1)
+    echo "  Range WORM: $worm_oldest → $worm_newest"
+    echo "  I file da cancellare sono compresi in questo range?"
+  fi
+
+  echo
+  ask_yesno "Procedere con cancellazione?" "N" || { press_enter; return; }
+  find /var/ossec/logs/archives /var/ossec/logs/alerts -name "*.gz" -mtime +$n -delete 2>/dev/null
+  find /var/ossec/logs/archives /var/ossec/logs/alerts -name "*.sum" -mtime +$n -delete 2>/dev/null
+  log_ok "Cleanup completato"
+  echo
+  df -h /var | tail -1
+  press_enter
+}
+
+maint_journald_vacuum() {
+  cat <<EOF
+
+  ${BOLD}═══ Journald vacuum + cap persistente ═══${NC}
+
+  Riduce la dimensione di /var/log/journal/ e imposta un limite massimo
+  permanente in /etc/systemd/journald.conf per evitare la ricrescita.
+
+EOF
+  echo "Spazio attuale journal:"
+  journalctl --disk-usage 2>&1 | sed 's/^/  /'
+  echo
+  read -r -p "Limite massimo journal [500M]: " maxuse
+  maxuse="${maxuse:-500M}"
+  ask_yesno "Procedere con vacuum a $maxuse + config persistente?" "Y" || { press_enter; return; }
+
+  echo
+  echo "── Vacuum immediato ──"
+  journalctl --vacuum-size=$maxuse 2>&1 | tail -3
+
+  echo
+  echo "── Config persistente in /etc/systemd/journald.conf ──"
+  if grep -q "^SystemMaxUse=" /etc/systemd/journald.conf 2>/dev/null; then
+    sed -i "s|^SystemMaxUse=.*|SystemMaxUse=$maxuse|" /etc/systemd/journald.conf
+  else
+    cp /etc/systemd/journald.conf /etc/systemd/journald.conf.bak-$(date +%Y%m%d-%H%M%S)
+    if grep -q "^#SystemMaxUse=" /etc/systemd/journald.conf 2>/dev/null; then
+      sed -i "s|^#SystemMaxUse=.*|SystemMaxUse=$maxuse|" /etc/systemd/journald.conf
+    else
+      echo "SystemMaxUse=$maxuse" >> /etc/systemd/journald.conf
+    fi
+    systemctl restart systemd-journald
+  fi
+  grep "^SystemMaxUse=" /etc/systemd/journald.conf
+  log_ok "Journal cap impostato a $maxuse"
+  press_enter
+}
+
+maint_remote_syslog_logrotate() {
+  cat <<EOF
+
+  ${BOLD}═══ Setup logrotate per /var/log/remote/ ═══${NC}
+
+  Configura logrotate per i log syslog raccolti da host esterni
+  (es. router Mikrotik via UDP 514). Rotazione giornaliera + compress.
+
+EOF
+  if [[ ! -d /var/log/remote ]]; then
+    log_warn "/var/log/remote non esiste — non sembra ci sia rsyslog configurato per log remoti"
+    press_enter; return
+  fi
+  echo "Stato attuale:"
+  du -sh /var/log/remote 2>/dev/null
+  echo "Top sotto-directory:"
+  du -sh /var/log/remote/* 2>/dev/null | sort -rh | head -5
+  echo
+  read -r -p "Retention in giorni [90]: " days
+  days="${days:-90}"
+  [[ "$days" =~ ^[0-9]+$ ]] || { log_error "Giorni deve essere un numero"; press_enter; return; }
+
+  ask_yesno "Procedere con setup logrotate + cleanup file >${days}gg?" "Y" || { press_enter; return; }
+
+  cat > /etc/logrotate.d/remote-syslog <<LOGROT
+# Logrotate per log syslog raccolti da host esterni
+# Generato da maintenance.sh, ${days}gg retention
+/var/log/remote/*/*.log {
+    daily
+    rotate $days
+    missingok
+    notifempty
+    compress
+    delaycompress
+    sharedscripts
+    postrotate
+        /usr/lib/rsyslog/rsyslog-rotate 2>/dev/null || true
+    endscript
+    su syslog syslog
+}
+LOGROT
+  log_ok "Config logrotate creata: /etc/logrotate.d/remote-syslog"
+
+  echo
+  echo "── Cleanup immediato file >${days}gg ──"
+  local count; count=$(find /var/log/remote -type f -mtime +${days} 2>/dev/null | wc -l)
+  echo "  File da cancellare: $count"
+  if [[ $count -gt 0 ]]; then
+    find /var/log/remote -type f -mtime +${days} -delete 2>/dev/null
+    log_ok "Cleanup completato"
+  fi
+  echo
+  echo "── Compress file >7gg non ancora compressi ──"
+  local compressed=0
+  for f in $(find /var/log/remote -name "*.log" -mtime +7 -size +1M 2>/dev/null); do
+    gzip "$f" 2>/dev/null && compressed=$((compressed+1))
+  done
+  log_ok "$compressed file compressi"
+  echo
+  du -sh /var/log/remote 2>/dev/null
+  press_enter
 }
 
 maint_rotate_wazuh() {
@@ -976,10 +1135,12 @@ menu_diagnostics() {
   ${BOLD}5)${NC}  Journal completo wazuh-immutable-store
   ${BOLD}6)${NC}  Journal completo wazuh-rolling-hash
   ${BOLD}7)${NC}  EPS Wazuh (stima eventi/sec)
+  ${BOLD}8)${NC}  Top consumer disco (/var dettaglio)
+  ${BOLD}9)${NC}  Stato cluster OpenSearch (health + indici)
   ${BOLD}0)${NC}  Torna
 
 EOF
-    read -r -p ">>> [0-7]: " c
+    read -r -p ">>> [0-9]: " c
     case "$c" in
       1) diag_nfs ;;
       2) gpg_test_signing ;;
@@ -988,10 +1149,37 @@ EOF
       5) journalctl -u wazuh-immutable-store.service --no-pager -n 100; press_enter ;;
       6) journalctl -u wazuh-rolling-hash.service --no-pager -n 100; press_enter ;;
       7) diag_eps ;;
+      8) diag_top_disk ;;
+      9) idx_cluster_quick_status ;;
       0) return ;;
       *) sleep 1 ;;
     esac
   done
+}
+
+diag_top_disk() {
+  echo -e "${BOLD}═══ Top consumer disco ═══${NC}\n"
+  echo "── Disco principale ──"
+  df -h / /var 2>/dev/null | sort -u | tail -3
+  echo
+  echo "── Top-level /var ──"
+  du -sh /var/* 2>/dev/null | sort -rh | head -10
+  echo
+  echo "── /var/lib/* ──"
+  du -sh /var/lib/* 2>/dev/null | sort -rh | head -8
+  echo
+  echo "── /var/log/* ──"
+  du -sh /var/log/* 2>/dev/null | sort -rh | head -10
+  echo
+  echo "── /var/ossec/* ──"
+  du -sh /var/ossec/* 2>/dev/null | sort -rh | head -8
+  echo
+  echo "── /var/ossec/queue/* (Wazuh queue) ──"
+  du -sh /var/ossec/queue/* 2>/dev/null | sort -rh | head -8
+  echo
+  echo "── /var/log/journal (journald) ──"
+  journalctl --disk-usage 2>&1
+  press_enter
 }
 
 diag_nfs() {
@@ -1191,6 +1379,359 @@ for a in data:
     w.writerow([a.get('name','?'), a.get('size_mb','?'), a.get('location','?'), a.get('created_at','?')])
 " > "$out" 2>/dev/null || log_warn "Export json non disponibile, uso fallback"
   log_ok "Lista esportata: $out"
+  press_enter
+}
+
+# ========================================================================
+# I. INDEXER OPENSEARCH (ISM, indici, cluster)
+# ========================================================================
+# Usa cert-based auth (admin.pem / admin-key.pem). Funziona out-of-the-box
+# su tutti i Wazuh manager con OpenSearch installato in modalità standard.
+
+IDX_CERT="/etc/wazuh-indexer/certs/admin.pem"
+IDX_KEY="/etc/wazuh-indexer/certs/admin-key.pem"
+IDX_HOST="https://localhost:9200"
+
+idx_curl() {
+  curl -sk --cert "$IDX_CERT" --key "$IDX_KEY" "$@"
+}
+
+idx_check_auth() {
+  if [[ ! -f "$IDX_CERT" ]] || [[ ! -f "$IDX_KEY" ]]; then
+    log_error "Cert admin OpenSearch non trovati in /etc/wazuh-indexer/certs/"
+    return 1
+  fi
+  local health; health=$(idx_curl "$IDX_HOST/_cluster/health" 2>&1)
+  if echo "$health" | grep -q "status"; then
+    return 0
+  else
+    log_error "Connessione OpenSearch fallita: $health" | head -3
+    return 1
+  fi
+}
+
+menu_indexer() {
+  idx_check_auth || { press_enter; return; }
+  while true; do
+    banner
+    cat <<EOF
+
+  ${BOLD}═══ OpenSearch Indexer (ISM + indici + cluster) ═══${NC}
+
+  ${BOLD}1)${NC}  Cluster health + statistiche
+  ${BOLD}2)${NC}  Lista indici (top per dimensione)
+  ${BOLD}3)${NC}  Aggregato indici per tipo (alerts/states/monitoring/...)
+  ${BOLD}4)${NC}  Lista ISM policy esistenti
+  ${BOLD}5)${NC}  Verifica policy ISM su un indice specifico
+  ${DIM}— ISM management (modifiche) —${NC}
+  ${BOLD}6)${NC}  Crea policy ISM 'wazuh-alerts-Ngg' + attach a indici
+  ${BOLD}7)${NC}  Stima risparmio per retention (30/60/90/180/365gg)
+  ${BOLD}8)${NC}  Delete retroattivo indici alerts >N giorni
+  ${BOLD}9)${NC}  Fix cluster yellow (number_of_replicas=0 single-node)
+  ${BOLD}0)${NC}  Torna
+
+EOF
+    read -r -p ">>> [0-9]: " c
+    case "$c" in
+      1) idx_cluster_status ;;
+      2) idx_list_indices ;;
+      3) idx_aggregate_by_type ;;
+      4) idx_list_policies ;;
+      5) idx_explain_policy ;;
+      6) idx_create_alerts_policy ;;
+      7) idx_estimate_retention ;;
+      8) idx_delete_old_alerts ;;
+      9) idx_fix_yellow ;;
+      0) return ;;
+      *) sleep 1 ;;
+    esac
+  done
+}
+
+idx_cluster_status() {
+  echo -e "${BOLD}═══ Cluster health ═══${NC}\n"
+  idx_curl "$IDX_HOST/_cluster/health?pretty" 2>&1 | head -20
+  echo
+  echo -e "${BOLD}═══ Stats nodes ═══${NC}\n"
+  idx_curl "$IDX_HOST/_cat/nodes?v&h=name,heap.percent,ram.percent,disk.used_percent,load_1m" 2>&1
+  echo
+  echo -e "${BOLD}═══ Shards unassigned (causa yellow/red) ═══${NC}\n"
+  idx_curl "$IDX_HOST/_cat/shards?v&h=index,shard,prirep,state,unassigned.reason" 2>&1 | grep -E "UNASSIGNED|INITIAL" | head -10 || echo "  (nessuno)"
+  press_enter
+}
+
+idx_cluster_quick_status() {
+  # Versione sintetica chiamata anche da menu diagnostica
+  idx_check_auth || { press_enter; return; }
+  echo -e "${BOLD}═══ OpenSearch quick status ═══${NC}\n"
+  idx_curl "$IDX_HOST/_cluster/health?pretty" 2>&1 | head -10
+  echo
+  echo "Indici attivi (totale):"
+  idx_curl "$IDX_HOST/_cat/indices?h=index" 2>&1 | wc -l
+  press_enter
+}
+
+idx_list_indices() {
+  echo -e "${BOLD}═══ Indici (top 30 per dimensione) ═══${NC}\n"
+  idx_curl "$IDX_HOST/_cat/indices?v&bytes=g&s=store.size:desc" 2>&1 | head -31
+  press_enter
+}
+
+idx_aggregate_by_type() {
+  echo -e "${BOLD}═══ Aggregato per tipo ═══${NC}\n"
+  idx_curl "$IDX_HOST/_cat/indices?h=index,store.size&bytes=b" 2>&1 | \
+    awk '{
+      n=split($1, p, "-"); type=p[1]"-"p[2]
+      sizes[type] += $2; counts[type]++
+    } END {
+      for (t in sizes) printf "  %-50s  %3d indici  %10.2f GB\n", t, counts[t], sizes[t]/1024/1024/1024
+    }' | sort -k4 -rn
+  press_enter
+}
+
+idx_list_policies() {
+  echo -e "${BOLD}═══ ISM policy ═══${NC}\n"
+  idx_curl "$IDX_HOST/_plugins/_ism/policies?pretty" 2>&1 | python3 -c "
+import json,sys
+try:
+  d=json.loads(sys.stdin.read())
+  print(f'  Policies totali: {d.get(\"total_policies\", 0)}')
+  for p in d.get('policies', [])[:20]:
+    pid = p.get('_id', '?')
+    pol = p.get('policy', {})
+    desc = pol.get('description', '')
+    states = ','.join([s['name'] for s in pol.get('states', [])])
+    print(f'')
+    print(f'  ID: {pid}')
+    print(f'  Description: {desc[:80]}')
+    print(f'  States: {states}')
+    for t in pol.get('ism_template', []):
+      print(f'  Template pattern: {t.get(\"index_patterns\", [])} priority={t.get(\"priority\", 0)}')
+except Exception as e:
+  print(f'  Errore parsing: {e}')
+" 2>&1
+  press_enter
+}
+
+idx_explain_policy() {
+  read -r -p "Pattern indice (es. wazuh-alerts-4.x-2026.05.27): " idx
+  [[ -z "$idx" ]] && { press_enter; return; }
+  echo
+  idx_curl "$IDX_HOST/_plugins/_ism/explain/$idx?pretty" 2>&1 | head -30
+  press_enter
+}
+
+idx_create_alerts_policy() {
+  cat <<EOF
+
+  ${BOLD}═══ Crea policy ISM wazuh-alerts-Ngg ═══${NC}
+
+  Crea una ISM policy che cancella automaticamente gli indici
+  wazuh-alerts-* più vecchi di N giorni. Si applica:
+    - Nuovi indici futuri (tramite ism_template)
+    - Indici esistenti (tramite POST /_plugins/_ism/add)
+
+EOF
+  read -r -p "Retention in giorni [90]: " days
+  days="${days:-90}"
+  [[ "$days" =~ ^[0-9]+$ ]] || { log_error "Giorni deve essere numerico"; press_enter; return; }
+  local policy_id="wazuh-alerts-${days}d"
+
+  echo
+  log_info "Creo policy: $policy_id (delete dopo ${days}d)"
+  ask_yesno "Procedere?" "Y" || { press_enter; return; }
+
+  local tmpf; tmpf=$(mktemp)
+  cat > "$tmpf" <<JSON
+{
+  "policy": {
+    "description": "Wazuh alerts ${days}-day retention (auto-delete >${days}d)",
+    "default_state": "hot",
+    "states": [
+      {"name": "hot", "actions": [], "transitions": [
+        {"state_name": "delete", "conditions": {"min_index_age": "${days}d"}}
+      ]},
+      {"name": "delete", "actions": [{"delete": {}}], "transitions": []}
+    ],
+    "ism_template": [
+      {"index_patterns": ["wazuh-alerts-*"], "priority": 100}
+    ]
+  }
+}
+JSON
+  echo
+  echo "── PUT policy ──"
+  idx_curl -X PUT "$IDX_HOST/_plugins/_ism/policies/$policy_id" \
+    -H 'Content-Type: application/json' -d @"$tmpf" 2>&1 | head -5
+  rm -f "$tmpf"
+
+  echo
+  log_info "Attach policy a indici esistenti wazuh-alerts-*"
+  ask_yesno "Attach a indici già esistenti?" "Y" || { press_enter; return; }
+  idx_curl -X POST "$IDX_HOST/_plugins/_ism/add/wazuh-alerts-*" \
+    -H 'Content-Type: application/json' \
+    -d "{\"policy_id\": \"$policy_id\"}" 2>&1 | python3 -c "
+import json,sys
+d=json.loads(sys.stdin.read())
+print(f'  updated_indices: {d.get(\"updated_indices\", 0)}')
+print(f'  failures: {d.get(\"failures\", False)}')
+"
+  press_enter
+}
+
+idx_estimate_retention() {
+  cat <<EOF
+
+  ${BOLD}═══ Stima risparmio per retention ═══${NC}
+
+EOF
+  local tmpf; tmpf=$(mktemp)
+  idx_curl "$IDX_HOST/_cat/indices/wazuh-alerts-*?h=index,store.size&bytes=b" > "$tmpf" 2>&1
+  python3 <<PYEOF
+import re
+from datetime import datetime, timedelta
+today = datetime.utcnow()
+buckets = {30: 0, 60: 0, 90: 0, 180: 0, 365: 0}
+count_per_bucket = {k: 0 for k in buckets}
+total = 0; n_idx = 0
+with open('$tmpf') as f:
+    for line in f:
+        parts = line.strip().split()
+        if len(parts) < 2: continue
+        idx = parts[0]
+        try: size = int(parts[1])
+        except: continue
+        total += size; n_idx += 1
+        m = re.search(r'(\d{4})\.(\d{2})\.(\d{2})', idx)
+        if not m: continue
+        try:
+            d = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            age = (today - d).days
+            for cutoff in buckets:
+                if age > cutoff:
+                    buckets[cutoff] += size
+                    count_per_bucket[cutoff] += 1
+        except: pass
+
+print(f"  Totale wazuh-alerts-*: {total/1024**3:.2f} GB ({n_idx} indici)\n")
+print(f"  {'Retention':>12s}  {'Indici cancellati':>20s}  {'Spazio liberato':>17s}  {'Rimane':>13s}")
+print(f"  {'-'*12}  {'-'*20}  {'-'*17}  {'-'*13}")
+for r in [30, 60, 90, 180, 365]:
+    n = count_per_bucket[r]
+    saved = buckets[r] / 1024**3
+    remaining = (total - buckets[r]) / 1024**3
+    pct = (saved/(total/1024**3)*100) if total else 0
+    print(f"  {r:>7} gg     {n:>20d}  {saved:>13.2f} GB ({pct:>3.0f}%)  {remaining:>10.2f} GB")
+PYEOF
+  rm -f "$tmpf"
+  press_enter
+}
+
+idx_delete_old_alerts() {
+  cat <<EOF
+
+  ${BOLD}═══ Delete retroattivo indici alerts >N giorni ═══${NC}
+
+  ${YELLOW}⚠ Operazione distruttiva.${NC} Cancella indici OpenSearch
+  permanentemente. Gli alert restano comunque su WORM (tar.gz
+  giornaliero), ma perdi velocità di query per quelle date.
+
+EOF
+  read -r -p "Cancella indici alerts più vecchi di quanti giorni? [90]: " days
+  days="${days:-90}"
+  [[ "$days" =~ ^[0-9]+$ ]] || { log_error "Giorni deve essere numerico"; press_enter; return; }
+
+  local tmpf; tmpf=$(mktemp)
+  idx_curl "$IDX_HOST/_cat/indices/wazuh-alerts-*?h=index,store.size&bytes=b" > "$tmpf" 2>&1
+  local todelf; todelf=$(mktemp)
+  python3 <<PYEOF > "$todelf"
+import re
+from datetime import datetime
+today = datetime.utcnow()
+total = 0
+with open('$tmpf') as f:
+    for line in f:
+        parts = line.strip().split()
+        if len(parts) < 2: continue
+        idx = parts[0]
+        try: size = int(parts[1])
+        except: continue
+        m = re.search(r'(\d{4})\.(\d{2})\.(\d{2})', idx)
+        if not m: continue
+        d = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        if (today - d).days > $days:
+            print(idx)
+PYEOF
+  local count; count=$(wc -l < "$todelf")
+  echo
+  echo "  Indici da cancellare: $count"
+  echo "  Sample (primi 3):"
+  head -3 "$todelf" | sed 's/^/    /'
+  echo "  Sample (ultimi 3):"
+  tail -3 "$todelf" | sed 's/^/    /'
+  rm -f "$tmpf"
+
+  echo
+  if [[ $count -eq 0 ]]; then
+    log_ok "Nessun indice da cancellare"
+    rm -f "$todelf"
+    press_enter; return
+  fi
+
+  ask_yesno "Procedere con cancellazione $count indici?" "N" || { rm -f "$todelf"; press_enter; return; }
+
+  cp "$todelf" "/root/wazuh-ism-cleanup-$(date +%Y%m%d-%H%M%S).list"
+  log_info "Backup lista in /root/wazuh-ism-cleanup-*.list"
+
+  local deleted=0 batch=() BATCH_SIZE=50
+  while IFS= read -r idx; do
+    batch+=("$idx")
+    if [ ${#batch[@]} -ge $BATCH_SIZE ]; then
+      local LIST=$(IFS=,; echo "${batch[*]}")
+      local resp; resp=$(idx_curl -X DELETE "$IDX_HOST/$LIST" 2>&1)
+      if echo "$resp" | grep -q '"acknowledged":true'; then
+        deleted=$((deleted + ${#batch[@]}))
+        echo "  ✓ batch $deleted/$count ok"
+      else
+        log_warn "Batch fallito: $resp" | head -1
+      fi
+      batch=()
+    fi
+  done < "$todelf"
+  # Ultimo batch
+  if [ ${#batch[@]} -gt 0 ]; then
+    local LIST=$(IFS=,; echo "${batch[*]}")
+    local resp; resp=$(idx_curl -X DELETE "$IDX_HOST/$LIST" 2>&1)
+    if echo "$resp" | grep -q '"acknowledged":true'; then
+      deleted=$((deleted + ${#batch[@]}))
+      echo "  ✓ batch finale $deleted/$count ok"
+    fi
+  fi
+  rm -f "$todelf"
+  log_ok "Cancellati $deleted / $count indici"
+  echo
+  df -h /var | tail -1
+  press_enter
+}
+
+idx_fix_yellow() {
+  cat <<EOF
+
+  ${BOLD}═══ Fix cluster yellow (number_of_replicas=0 single-node) ═══${NC}
+
+  Su cluster single-node, le repliche non possono essere allocate
+  (servirebbe un secondo nodo). Imposta number_of_replicas=0 su tutti
+  gli indici per portare il cluster da yellow a green.
+
+EOF
+  ask_yesno "Procedere?" "Y" || { press_enter; return; }
+  idx_curl -X PUT "$IDX_HOST/_all/_settings" \
+    -H 'Content-Type: application/json' \
+    -d '{"index": {"number_of_replicas": 0}}' 2>&1 | head -2
+  sleep 2
+  echo
+  echo "Cluster health dopo:"
+  idx_curl "$IDX_HOST/_cluster/health?pretty" 2>&1 | head -6
   press_enter
 }
 
