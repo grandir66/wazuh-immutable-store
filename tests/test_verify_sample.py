@@ -299,6 +299,59 @@ class TestStorageSvuotatoRilevato(unittest.TestCase):
             self.assertEqual(results['archives_checked'], 0)
             self.assertEqual(results['archive_errors'], [])
 
+    def test_manifest_assente_e_backend_vuoto_e_valido(self):
+        """Nessun file manifest.log per niente (primo avvio): stesso esito
+        di 'vergine', non deve essere confuso con 'corrotto'."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            sm = _make_signing_manager(base / 'manifests', sample_per_run=5)
+            self.assertFalse(sm.integrity_manager.manifest_file.exists())
+            backend = FakeBackend([])
+
+            valid, results = sm.verify_all_integrity(backend=backend, ledger=None)
+
+            self.assertTrue(valid)
+            self.assertEqual(results['archive_errors'], [])
+
+    def test_manifest_con_riga_corrotta_e_backend_vuoto_e_non_valido(self):
+        """Riproduce lo scenario della re-review: una riga con `size` non
+        numerico (bit rot / scrittura interrotta) fa fallire il parsing
+        severo di get_manifest_entries(). Prima della fix questo tornava
+        una lista PARZIALE ([] se l'errore era sulla prima riga),
+        indistinguibile da 'manifest vergine': con un backend che elenca
+        zero archivi (cancellazione totale), l'esito risultava
+        erroneamente valido. Il manifest corrotto deve invece essere un
+        caso distinto, con esito non valido."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            manifest_dir = base / 'manifests'
+            manifest_dir.mkdir(parents=True)
+            manifest_file = manifest_dir / 'manifest.log'
+            # Stesso formato di ManifestEntry.to_line(), ma con `size` (terzo
+            # campo) corrotto: 'NOTANUMBER' al posto di un intero.
+            manifest_file.write_text(
+                "deadbeef  wazuh-logs-2026-01-01.tar.gz  NOTANUMBER  "
+                "2026-01-01T00:00:00+00:00  PREV:GENESIS\n"
+            )
+
+            sm = _make_signing_manager(manifest_dir, sample_per_run=5)
+            # La catena valida questa riga (non fa int()/fromisoformat()):
+            # conferma che è proprio la guardia sul manifest a intercettare
+            # il problema, non la validazione della catena.
+            chain_valid, chain_errors = sm.integrity_manager.verify_manifest_chain()
+            self.assertTrue(chain_valid, chain_errors)
+
+            backend = FakeBackend([])  # cancellazione totale simulata
+
+            valid, results = sm.verify_all_integrity(backend=backend, ledger=None)
+
+            self.assertFalse(valid)
+            self.assertTrue(
+                any('corrotto' in err or 'illeggibile' in err
+                    for err in results['archive_errors']),
+                results['archive_errors'],
+            )
+
 
 class TestLedgerCheFalliceNonPerdeLEsito(unittest.TestCase):
     """Critical 2: un'eccezione nella scrittura del ledger non deve far

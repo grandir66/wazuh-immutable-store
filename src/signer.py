@@ -33,6 +33,20 @@ class SigningError(Exception):
     pass
 
 
+class ManifestCorruptedError(Exception):
+    """Una riga del manifest esiste ma non si riesce a interpretare (bit
+    rot, scrittura interrotta a metà riga, formato inatteso).
+
+    Distinta da "manifest vuoto/assente": chi usa get_manifest_entries()
+    come prova di "quanti archivi dovrebbero esserci" (vedi
+    SigningManager._verify_sample) deve poter distinguere un manifest
+    genuinamente vergine da uno illeggibile, altrimenti un manifest corrotto
+    verrebbe letto come "nessun archivio atteso" e una cancellazione totale
+    dello storage passerebbe come esito valido.
+    """
+    pass
+
+
 class GPGSigner:
     """Handles GPG signing operations for archives"""
 
@@ -396,33 +410,49 @@ class IntegrityManager:
             return False, errors
 
     def get_manifest_entries(self) -> List[ManifestEntry]:
-        """Load all manifest entries"""
+        """Load all manifest entries.
+
+        Solleva `ManifestCorruptedError` se una riga esiste ma non si
+        riesce a interpretare (formato inatteso, `size`/`created_at` non
+        validi). PRIMA di questa modifica un errore di parsing veniva
+        inghiottito e la funzione tornava la lista PARZIALE raccolta fino a
+        quel punto (`[]` se l'errore era sulla prima riga): indistinguibile
+        da "il manifest è vergine, non è mai stato scritto nulla". Un
+        manifest con una riga corrotta (bit rot, scrittura interrotta)
+        veniva quindi letto come "nessun archivio atteso".
+        """
         entries = []
 
         if not self.manifest_file.exists():
             return entries
 
-        try:
-            with open(self.manifest_file, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
+        with open(self.manifest_file, 'r') as f:
+            for numero, line in enumerate(f, start=1):
+                line = line.strip()
+                if not line:
+                    continue
 
-                    parts = line.split('  ')
-                    if len(parts) >= 5:
-                        entry = ManifestEntry(
-                            archive_id=parts[1].split('-')[1] if '-' in parts[1] else parts[1],
-                            filename=parts[1],
-                            checksum=parts[0],
-                            size=int(parts[2]),
-                            created_at=datetime.fromisoformat(parts[3]),
-                            previous_manifest_hash=parts[4].replace('PREV:', '') if parts[4] != 'PREV:GENESIS' else None
-                        )
-                        entries.append(entry)
+                parts = line.split('  ')
+                if len(parts) < 5:
+                    raise ManifestCorruptedError(
+                        f"Riga {numero} del manifest non interpretabile: formato inatteso"
+                    )
 
-        except Exception as e:
-            logger.error(f"Failed to load manifest entries: {e}")
+                try:
+                    entry = ManifestEntry(
+                        archive_id=parts[1].split('-')[1] if '-' in parts[1] else parts[1],
+                        filename=parts[1],
+                        checksum=parts[0],
+                        size=int(parts[2]),
+                        created_at=datetime.fromisoformat(parts[3]),
+                        previous_manifest_hash=parts[4].replace('PREV:', '') if parts[4] != 'PREV:GENESIS' else None
+                    )
+                except (ValueError, IndexError) as e:
+                    raise ManifestCorruptedError(
+                        f"Riga {numero} del manifest corrotta: {e}"
+                    ) from e
+
+                entries.append(entry)
 
         return entries
 
@@ -590,7 +620,21 @@ class SigningManager:
             # se non ne trova nessuno, l'esito non può essere valido. Se il
             # manifest è vuoto (storage vergine, mai archiviato nulla), un
             # elenco vuoto è coerente e resta valido.
-            entries_attese = self.integrity_manager.get_manifest_entries()
+            try:
+                entries_attese = self.integrity_manager.get_manifest_entries()
+            except ManifestCorruptedError as e:
+                # Un manifest illeggibile NON è un manifest vergine: prima
+                # di questo controllo get_manifest_entries() inghiottiva
+                # l'errore di parsing e tornava [] (indistinguibile da
+                # "mai archiviato nulla"). Con un backend che non elenca
+                # nulla, quella confusione avrebbe fatto passare una
+                # cancellazione totale come esito valido.
+                results['archive_errors'].append(
+                    "manifest locale illeggibile/corrotto (%s): impossibile "
+                    "confermare se lo storage è vergine o svuotato, trattato "
+                    "come possibile cancellazione" % e
+                )
+                return False
             if entries_attese:
                 results['archive_errors'].append(
                     "il manifest registra %d archivi ma il backend non ne "
