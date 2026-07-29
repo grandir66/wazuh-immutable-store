@@ -838,6 +838,12 @@ class WazuhImmutableStore:
             self.state.update_retention_policy({
                 'remote_days': self.models['retention'].remote.days,
                 'mode': backend_info.get('type'),
+                # Un log viene archiviato solo dopo `days_before_archive` giorni:
+                # senza questo dato chi osserva lo stato non può distinguere
+                # "nessun archivio nuovo perché è tutto fermo" da "nessun
+                # archivio nuovo perché i log di oggi non sono ancora maturi".
+                'days_before_archive': self.models['retention'].local.days_before_archive,
+                'days_keep_local': self.models['retention'].local.days_keep_local,
             })
         except Exception as e:
             # Lo stato è osservabilità: un suo problema non deve far fallire il comando.
