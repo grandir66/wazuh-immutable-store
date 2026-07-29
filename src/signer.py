@@ -9,15 +9,23 @@ import subprocess
 import hashlib
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, TYPE_CHECKING
 from dataclasses import dataclass
 
 from models import ArchiveRecord, ArchiveStatus, GPGConfig, IntegrityConfig, ManifestEntry
 
+if TYPE_CHECKING:
+    from storage_backends.base import StorageBackend
+    from verify_ledger import VerificationLedger
+
 
 logger = logging.getLogger(__name__)
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
 
 class SigningError(Exception):
@@ -492,9 +500,29 @@ class SigningManager:
 
         return len(errors) == 0, errors
 
-    def verify_all_integrity(self) -> Tuple[bool, dict]:
+    def verify_all_integrity(self, backend: Optional["StorageBackend"] = None,
+                              ledger: Optional["VerificationLedger"] = None) -> Tuple[bool, dict]:
         """
-        Verify integrity of all archives in manifest
+        Verifica la catena dei manifest E, a rotazione, un campione reale di
+        archivi rileti dallo storage (sha256 ricalcolato + firma GPG).
+
+        Prima di questa modifica la funzione validava SOLO la catena dei
+        manifest: nessun archivio veniva mai riletto, nessun hash ricalcolato,
+        nessuna delle firme GPG presenti sullo storage veniva mai verificata
+        (era il TODO "Could also verify each archive file if paths are
+        accessible", mai chiuso). Su NFS l'esportazione consente creazione,
+        modifica e cancellazione dei file anche nel sottoalbero degli archivi:
+        la sola catena dei manifest non rivela una manomissione fatta
+        direttamente sullo storage.
+
+        Args:
+            backend: backend storage da cui rileggere gli archivi campionati.
+                Se None (o se `integrity_config.sample_per_run` è 0), il
+                campionamento è saltato e l'esito dipende solo dalla catena
+                (comportamento legacy, esplicitamente preservato).
+            ledger: registro delle verifiche già fatte, per la rotazione del
+                campione. Se None, il campione è semplicemente "i primi N"
+                restituiti dal backend (nessuna rotazione fra i giri).
 
         Returns:
             Tuple of (all_valid, detailed_results)
@@ -512,7 +540,103 @@ class SigningManager:
         results['manifest_chain_valid'] = chain_valid
         results['chain_errors'] = chain_errors
 
-        # TODO: Could also verify each archive file if paths are accessible
-        # This would be done during recovery operations
+        sample_size = self.integrity_manager.config.sample_per_run
 
-        return chain_valid and len(chain_errors) == 0, results
+        if sample_size <= 0:
+            # 0 disattiva esplicitamente il campionamento: solo catena.
+            sample_valid = True
+        elif backend is None:
+            results['archive_errors'].append(
+                "Campionamento configurato (sample_per_run=%d) ma nessun backend "
+                "storage disponibile per rileggere gli archivi" % sample_size
+            )
+            sample_valid = False
+        else:
+            sample_valid = self._verify_sample(backend, ledger, sample_size, results)
+
+        return (chain_valid and len(chain_errors) == 0 and sample_valid), results
+
+    def _verify_sample(self, backend: "StorageBackend",
+                        ledger: Optional["VerificationLedger"],
+                        sample_size: int, results: dict) -> bool:
+        """Sceglie a rotazione fino a `sample_size` archivi dal backend, li
+        rilegge e li verifica. Un errore su un singolo archivio NON interrompe
+        il giro: viene registrato in `results['archive_errors']` e si prosegue
+        con gli altri. Popola `archives_checked`/`archives_valid` sul posto.
+
+        Ritorna False se anche un solo archivio campionato risulta alterato,
+        illeggibile o con firma non verificabile.
+        """
+        try:
+            archivi = backend.list_archives()
+        except Exception as e:
+            results['archive_errors'].append(
+                f"Impossibile enumerare gli archivi dal backend: {e}"
+            )
+            return False
+
+        if not archivi:
+            return True  # niente da campionare (storage vuoto)
+
+        by_id = {a['name']: a for a in archivi if a.get('name')}
+        tutti_gli_id = list(by_id.keys())
+
+        if ledger is not None:
+            scelti = ledger.pick_least_recently_verified(tutti_gli_id, sample_size)
+        else:
+            scelti = tutti_gli_id[:sample_size]
+
+        tutti_validi = True
+        for archive_id in scelti:
+            item = by_id[archive_id]
+            ok, errori = self._verify_single_archive(item)
+            results['archives_checked'] += 1
+            if ok:
+                results['archives_valid'] += 1
+            else:
+                tutti_validi = False
+                for err in errori:
+                    results['archive_errors'].append(f"{archive_id}: {err}")
+
+        if ledger is not None and scelti:
+            # Si registra il TENTATIVO per tutti gli scelti (validi o no):
+            # vedi VerificationLedger.record_verified per il perché.
+            ledger.record_verified(scelti, _now_iso())
+
+        return tutti_validi
+
+    def _verify_single_archive(self, item: dict) -> Tuple[bool, List[str]]:
+        """Rilegge un archivio (via il locator restituito da list_archives,
+        MAI un percorso ricostruito a mano) e verifica sha256 + firma GPG.
+
+        Non solleva: qualunque problema (file assente, NFS che non risponde,
+        permessi, firma non verificabile) torna come lista di errori.
+        """
+        errors: List[str] = []
+        locator = item.get('locator')
+        if not locator:
+            return False, ["locator mancante nella voce restituita dal backend"]
+
+        archive_path = Path(locator)
+        try:
+            if not archive_path.exists():
+                return False, [f"archivio non trovato sullo storage: {archive_path}"]
+
+            if not self.integrity_manager.verify_checksum_file(archive_path):
+                errors.append("sha256 ricalcolato non corrisponde al file .sha256 accanto")
+
+            if self.gpg_signer and self.gpg_signer.enabled:
+                sig_path = archive_path.with_suffix(archive_path.suffix + '.sig')
+                if not sig_path.exists():
+                    errors.append("firma GPG (.sig) mancante")
+                elif not self.gpg_signer.verify_signature(archive_path, sig_path):
+                    errors.append("firma GPG non valida")
+
+        except OSError as e:
+            # File system/NFS irraggiungibile a metà lettura: non deve
+            # interrompere il giro sugli altri archivi del campione.
+            errors.append(f"errore di lettura dal backend: {e}")
+        except Exception as e:
+            errors.append(f"errore inatteso durante la verifica: {e}")
+
+        return len(errors) == 0, errors
