@@ -87,6 +87,28 @@ class StorageBackend(ABC):
     def get_disk_usage(self) -> Optional[dict]:
         """{size, used, available, use_percent} o None se non disponibile."""
 
+    # ---------- Integrity ----------
+
+    def replicate_manifest(self, manifest_path: Path) -> bool:
+        """Copia `manifest_path` sullo storage immutabile, in una posizione
+        fissa e nota (NON nel layout per-anno degli archivi).
+
+        Serve a far sopravvivere la catena dei manifest alla perdita della
+        directory temporanea locale dove viene scritta (unica copia, oggi):
+        per questo scrive sempre sullo STESSO percorso remoto, sovrascrivendolo
+        (idempotente) — mai altri file.
+
+        Best-effort: ritorna True/False, non solleva mai. Il chiamante
+        (`run_archive`) tratta un fallimento come un warning da loggare, non
+        come motivo per far fallire un ciclo di archiviazione già riuscito.
+
+        Implementazione di default: no-op che ritorna False, per i backend
+        che non la supportano ancora (object storage) — dichiarano così
+        esplicitamente di non farlo, invece di fallire in modo oscuro o
+        silenzioso più a valle.
+        """
+        return False
+
     # ---------- Helpers (default impl) ----------
 
     @property

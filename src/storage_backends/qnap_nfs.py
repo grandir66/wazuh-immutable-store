@@ -140,6 +140,25 @@ class QNAPStorageBackend(StorageBackend):
         shutil.copy2(src, dest)
         return dest
 
+    # ---------- Integrity ----------
+
+    def replicate_manifest(self, manifest_path: Path) -> bool:
+        if not manifest_path.exists():
+            logger.warning(f"Manifest non trovato, replica saltata: {manifest_path}")
+            return False
+        if not self._nfs.is_mounted():
+            if not self._nfs.mount():
+                logger.warning("Replica manifest saltata: mount NFS non disponibile")
+                return False
+        try:
+            dest = self._nfs.mount_point / "manifests" / manifest_path.name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(manifest_path, dest)
+            return True
+        except OSError as e:
+            logger.warning(f"Replica manifest fallita: {e}")
+            return False
+
     # ---------- Operations ----------
 
     def get_disk_usage(self) -> Optional[dict]:
