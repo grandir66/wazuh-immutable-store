@@ -44,7 +44,7 @@ class WazuhConfig:
 
 @dataclass
 class QNAPConfig:
-    """QNAP NFS configuration"""
+    """QNAP NFS configuration (firmware WORM enforcement)."""
     host: str
     export_path: str
     mount_point: Path
@@ -54,6 +54,52 @@ class QNAPConfig:
     @property
     def nfs_source(self) -> str:
         return f"{self.host}:{self.export_path}"
+
+
+@dataclass
+class GenericNFSConfig:
+    """Generic NFS share (no WORM firmware)."""
+    host: str
+    export_path: str
+    mount_point: Path
+    nfs_version: int = 4
+    mount_options: str = "hard,intr,rsize=65536,wsize=65536"
+    idempotent_skip: bool = False  # se True, skip upload se file remote esiste
+
+    @property
+    def nfs_source(self) -> str:
+        return f"{self.host}:{self.export_path}"
+
+
+@dataclass
+class S3Config:
+    """S3-compatible storage (MinIO, Wasabi, AWS S3, Cloudflare R2, Backblaze B2)."""
+    endpoint: str                       # es: "http://192.168.99.118:9000"
+    bucket: str                         # es: "wazuh-archive"
+    access_key: str = ""                # iniettato da env var o keystore
+    secret_key: str = ""
+    region: str = "us-east-1"           # cosmetico per MinIO, richiesto da AWS SDK v2
+    path_style: bool = True             # True per MinIO/self-hosted, False per AWS reale
+    verify_tls: bool = True             # False per cert self-signed di POC
+    use_object_lock: bool = False       # True attiva retention WORM su ogni PUT
+    retention_mode: str = "COMPLIANCE"  # "COMPLIANCE" o "GOVERNANCE"
+    retention_days: int = 2555          # ~7 anni, applicato solo se use_object_lock
+    organize_by_date: bool = True       # key layout: YYYY/MM/name.tar.gz
+    key_prefix: str = ""                # opzionale, prefisso davanti al layout
+
+
+@dataclass
+class StorageConfig:
+    """Configurazione storage unificata: scegli UN backend attivo.
+
+    Compatibile col legacy `qnap:` di config.yaml — ConfigLoader sintetizza
+    automaticamente una StorageConfig di tipo qnap-nfs se la sezione `storage:`
+    non è presente.
+    """
+    type: str = "qnap-nfs"  # qnap-nfs | generic-nfs | minio-s3 | s3-compatible
+    qnap_nfs: Optional[QNAPConfig] = None
+    generic_nfs: Optional[GenericNFSConfig] = None
+    s3: Optional[S3Config] = None
 
 
 @dataclass

@@ -14,7 +14,8 @@ from pathlib import Path
 from typing import Optional
 
 from models import (
-    WazuhConfig, QNAPConfig, ArchiveConfig, GPGConfig,
+    WazuhConfig, QNAPConfig, GenericNFSConfig, S3Config, StorageConfig,
+    ArchiveConfig, GPGConfig,
     IntegrityConfig, RetentionConfig, LocalRetention, RemoteRetention,
     CompressionType, ArchiveInterval, RecoveryRequest
 )
@@ -26,6 +27,7 @@ from recovery import RecoveryManager
 from historical import HistoricalArchiveManager, HistoricalLogsScanner, WazuhLogsCleaner
 from wizard import SetupWizard
 from menu import InteractiveMenu
+from storage_backends import get_backend, StorageBackend, StorageBackendError
 
 
 # Configure logging
@@ -34,6 +36,14 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger('wazuh-immutable-store')
+
+
+def _env_value(name: Optional[str]) -> Optional[str]:
+    """Resolve env var name → value, None se name è None o env vuoto."""
+    import os
+    if not name:
+        return None
+    return os.environ.get(name)
 
 
 class ConfigLoader:
@@ -80,7 +90,7 @@ class ConfigLoader:
             alerts_path=Path(wazuh['alerts_path']) if wazuh.get('alerts_path') else None
         )
 
-        # QNAP config
+        # QNAP config (legacy + compat)
         qnap = config.get('qnap', {})
         models['qnap'] = QNAPConfig(
             host=qnap.get('host', ''),
@@ -89,6 +99,68 @@ class ConfigLoader:
             nfs_version=qnap.get('nfs_version', 4),
             mount_options=qnap.get('mount_options', 'hard,intr')
         )
+
+        # Storage backend config (nuovo, backward-compatible)
+        # Se `storage:` non è presente in config.yaml, sintetizziamo qnap-nfs
+        # dalla vecchia chiave `qnap:` per non rompere installazioni esistenti.
+        storage = config.get('storage')
+        if storage is None:
+            logger.info("Nessuna sezione 'storage:' in config.yaml — uso qnap-nfs legacy")
+            models['storage'] = StorageConfig(type='qnap-nfs', qnap_nfs=models['qnap'])
+        else:
+            storage_type = storage.get('type', 'qnap-nfs')
+            sc = StorageConfig(type=storage_type)
+
+            if storage_type == 'qnap-nfs':
+                qcfg = storage.get('qnap_nfs', qnap)  # fallback alla vecchia chiave
+                sc.qnap_nfs = QNAPConfig(
+                    host=qcfg.get('host', ''),
+                    export_path=qcfg.get('export_path', '/wazuh-archive'),
+                    mount_point=Path(qcfg.get('mount_point', '/mnt/qnap-wazuh')),
+                    nfs_version=qcfg.get('nfs_version', 4),
+                    mount_options=qcfg.get('mount_options', 'hard,intr'),
+                )
+            elif storage_type == 'generic-nfs':
+                ncfg = storage.get('generic_nfs', {})
+                sc.generic_nfs = GenericNFSConfig(
+                    host=ncfg.get('host', ''),
+                    export_path=ncfg.get('export_path', ''),
+                    mount_point=Path(ncfg.get('mount_point', '/mnt/wazuh-archive')),
+                    nfs_version=ncfg.get('nfs_version', 4),
+                    mount_options=ncfg.get('mount_options', 'hard,intr'),
+                    idempotent_skip=ncfg.get('idempotent_skip', False),
+                )
+            elif storage_type in ('minio-s3', 's3-compatible'):
+                scfg = storage.get('s3', {})
+                # Credenziali: file env, env var, o inline (sconsigliato)
+                access_key = (
+                    scfg.get('access_key')
+                    or _env_value(scfg.get('access_key_env'))
+                    or ''
+                )
+                secret_key = (
+                    scfg.get('secret_key')
+                    or _env_value(scfg.get('secret_key_env'))
+                    or ''
+                )
+                sc.s3 = S3Config(
+                    endpoint=scfg.get('endpoint', ''),
+                    bucket=scfg.get('bucket', ''),
+                    access_key=access_key,
+                    secret_key=secret_key,
+                    region=scfg.get('region', 'us-east-1'),
+                    path_style=scfg.get('path_style', True),
+                    verify_tls=scfg.get('verify_tls', True),
+                    use_object_lock=scfg.get('use_object_lock', False),
+                    retention_mode=scfg.get('retention_mode', 'COMPLIANCE'),
+                    retention_days=scfg.get('retention_days', 2555),
+                    organize_by_date=scfg.get('organize_by_date', True),
+                    key_prefix=scfg.get('key_prefix', ''),
+                )
+            else:
+                raise ValueError(f"storage.type sconosciuto: {storage_type!r}")
+
+            models['storage'] = sc
 
         # Archive config
         archive = config.get('archive', {})
@@ -150,42 +222,64 @@ class WazuhImmutableStore:
         self.config = ConfigLoader.load(self.config_path)
         self.models = ConfigLoader.to_models(self.config)
 
-    def run_archive(self, dry_run: bool = False, auto_cleanup: bool = True):
-        """Run archive cycle with optional automatic local cleanup
+    def _mount_point(self) -> Optional[Path]:
+        """Mount point locale del backend corrente, se è NFS-style.
 
-        Args:
-            dry_run: If True, simulate without making changes
-            auto_cleanup: If True, cleanup local logs after successful transfer
+        Ritorna None per backend object storage (S3): le operazioni
+        filesystem-based (recovery, retention scan, list archives via filesystem)
+        non sono direttamente applicabili e vanno gestite via backend API.
+        """
+        s = self.models.get('storage')
+        if s is None:
+            return None
+        if s.type == 'qnap-nfs' and s.qnap_nfs is not None:
+            return s.qnap_nfs.mount_point
+        if s.type == 'generic-nfs' and s.generic_nfs is not None:
+            return s.generic_nfs.mount_point
+        # S3 / unknown: no local mount point
+        return None
+
+    def run_archive(self, dry_run: bool = False, auto_cleanup: bool = True):
+        """Run archive cycle with optional automatic local cleanup.
+
+        Usa il backend storage configurato (qnap-nfs / generic-nfs / s3-compatible).
         """
         logger.info("Starting archive cycle...")
 
-        # Initialize managers with remote mount point for WORM check
+        backend: StorageBackend = get_backend(
+            self.models['storage'],
+            self.models['retention'].remote,
+        )
+        logger.info(f"Storage backend: {backend.type_name}")
+
+        # Per il "WORM idempotency skip" durante la creazione, l'archiver
+        # ha bisogno di sapere se un archivio è già stato caricato.
+        # Per backend filesystem (NFS) gli passiamo il mount point per scan veloce.
+        # Per S3 passiamo None: archiver creerà l'archivio e poi lo skip avviene
+        # in fase di upload (backend.archive_exists()).
         archive_manager = ArchiveManager(
             self.models['wazuh'],
             self.models['archive'],
-            remote_mount_point=self.models['qnap'].mount_point
+            remote_mount_point=backend.local_mount_point,
         )
 
-        # Create archives
         records = archive_manager.run_archive_cycle(
             min_age_days=self.models['retention'].local.days_before_archive
         )
 
         if not records:
             logger.info("No archives created")
-            # Even if no new archives, still run cleanup for previously archived logs
             if auto_cleanup and not dry_run:
-                self._auto_cleanup_local()
+                self._auto_cleanup_local(backend)
             return
 
-        # Sign archives
+        # Sign archives (backend-agnostic)
         manifest_dir = self.models['archive'].temp_dir / 'manifests'
         signing_manager = SigningManager(
             self.models['gpg'],
             self.models['integrity'],
             manifest_dir
         )
-
         for record in records:
             try:
                 signing_manager.sign_and_record(record)
@@ -193,30 +287,53 @@ class WazuhImmutableStore:
             except Exception as e:
                 logger.error(f"Failed to sign {record.id}: {e}")
 
-        # Transfer to QNAP
+        # Upload via backend astratto
         successful = 0
         failed = 0
         if not dry_run:
-            transfer_manager = TransferManager(
-                self.models['qnap'],
-                self.models['retention'].remote
-            )
+            if not backend.connect():
+                logger.error(f"Backend {backend.type_name} connect failed; abort transfer")
+                return
 
             for record in records:
-                transfer_manager.add_to_queue(record)
+                try:
+                    locator = backend.upload_archive(record)
+                    logger.info(f"Uploaded ({backend.type_name}): {locator}")
+                    successful += 1
+                except StorageBackendError as e:
+                    logger.error(f"Upload failed for {record.id}: {e}")
+                    failed += 1
 
-            successful, failed = transfer_manager.process_queue()
             logger.info(f"Transfer complete: {successful} successful, {failed} failed")
 
-            # Auto cleanup local logs after successful transfer
             if auto_cleanup and successful > 0:
-                self._auto_cleanup_local()
+                self._auto_cleanup_local(backend)
 
         logger.info("Archive cycle complete")
 
-    def _auto_cleanup_local(self):
-        """Automatically cleanup local Wazuh logs that have been archived to WORM"""
+    def _auto_cleanup_local(self, backend: Optional[StorageBackend] = None):
+        """Automatically cleanup local Wazuh logs that have been archived.
+
+        Per backend filesystem (NFS) usa il mount point per scan veloce.
+        Per S3 il cleanup richiede un meccanismo diverso (not implemented v1):
+        skippiamo per ora; in produzione si manterrebbe anche un backend QNAP
+        per il check, oppure si fa archive_exists() per ogni log group.
+        """
         logger.info("Running automatic local cleanup...")
+
+        if backend is None:
+            backend = get_backend(
+                self.models['storage'],
+                self.models['retention'].remote,
+            )
+
+        mount_point = backend.local_mount_point
+        if mount_point is None:
+            logger.info(
+                f"Backend {backend.type_name} non ha mount point locale; "
+                "skip cleanup (TODO: implementare cleaner S3-aware in iterazione successiva)"
+            )
+            return
 
         keep_days = self.models['retention'].local.days_keep_local
 
@@ -226,7 +343,7 @@ class WazuhImmutableStore:
         )
 
         results = cleaner.clean_archived_logs(
-            self.models['qnap'].mount_point,
+            mount_point,
             keep_local_days=keep_days,
             dry_run=False
         )
@@ -248,7 +365,7 @@ class WazuhImmutableStore:
         retention_manager = RetentionManager(
             self.models['retention'],
             self.models['archive'].temp_dir,
-            self.models['qnap'].mount_point,
+            self._mount_point(),
             []  # Would load existing records from database
         )
 
@@ -286,7 +403,7 @@ class WazuhImmutableStore:
 
         recovery_manager = RecoveryManager(
             self.models['archive'].temp_dir,
-            self.models['qnap'].mount_point,
+            self._mount_point(),
             self.models['gpg'],
             self.models['integrity']
         )
@@ -313,7 +430,7 @@ class WazuhImmutableStore:
         """List available archives"""
         recovery_manager = RecoveryManager(
             self.models['archive'].temp_dir,
-            self.models['qnap'].mount_point,
+            self._mount_point(),
             self.models['gpg'],
             self.models['integrity']
         )
@@ -332,8 +449,8 @@ class WazuhImmutableStore:
                     'created': a.created.isoformat(),
                     'has_signature': a.has_signature,
                     'has_checksum': a.has_checksum,
-                    'location': 'remote' if self.models['qnap'].mount_point and
-                               str(self.models['qnap'].mount_point) in str(a.path) else 'local'
+                    'location': 'remote' if self._mount_point() and
+                               str(self._mount_point()) in str(a.path) else 'local'
                 }
                 for a in recovery_manager.searcher.find_archives_by_date_range(start, end)
             ]
@@ -353,7 +470,7 @@ class WazuhImmutableStore:
         """Browse contents of an archive"""
         recovery_manager = RecoveryManager(
             self.models['archive'].temp_dir,
-            self.models['qnap'].mount_point,
+            self._mount_point(),
             self.models['gpg'],
             self.models['integrity']
         )
@@ -385,7 +502,7 @@ class WazuhImmutableStore:
         """Show archive statistics"""
         recovery_manager = RecoveryManager(
             self.models['archive'].temp_dir,
-            self.models['qnap'].mount_point,
+            self._mount_point(),
             self.models['gpg'],
             self.models['integrity']
         )
@@ -421,7 +538,7 @@ class WazuhImmutableStore:
             self.models['wazuh'],
             self.models['archive'],
             self.models['retention'],
-            self.models['qnap'].mount_point
+            self._mount_point()
         )
 
         analysis = historical_manager.analyze_historical_logs()
@@ -477,7 +594,7 @@ class WazuhImmutableStore:
         )
 
         results = cleaner.clean_archived_logs(
-            self.models['qnap'].mount_point,
+            self._mount_point(),
             keep_local_days=keep_days,
             dry_run=dry_run
         )
@@ -516,7 +633,7 @@ class WazuhImmutableStore:
 
         print(f"\nQNAP NFS Server: {self.models['qnap'].host}")
         print(f"  Export: {self.models['qnap'].export_path}")
-        print(f"  Mount point: {self.models['qnap'].mount_point}")
+        print(f"  Mount point: {self._mount_point()}")
         print(f"  Status: {'✓ Connected' if connected else '✗ Not Connected'}")
         print(f"  Message: {message}")
         print(f"  Mounted: {'✓ Yes' if nfs_manager.is_mounted() else '✗ No'}")
@@ -530,7 +647,7 @@ class WazuhImmutableStore:
             mount_opts = self.models['qnap'].mount_options
             host = self.models['qnap'].host
             export = self.models['qnap'].export_path
-            mount_point = self.models['qnap'].mount_point
+            mount_point = self._mount_point()
             print(f"\n  Per montare manualmente:")
             print(f"  sudo mount -t nfs -o vers={nfs_ver},{mount_opts} {host}:{export} {mount_point}")
 
@@ -585,7 +702,7 @@ class WazuhImmutableStore:
         # Test 2: Check if mounted
         print("\n[2/4] Checking NFS mount...")
         if nfs_manager.is_mounted():
-            print(f"  ✓ NFS is mounted at {self.models['qnap'].mount_point}")
+            print(f"  ✓ NFS is mounted at {self._mount_point()}")
         else:
             print(f"  ✗ NFS is not mounted")
             print(f"\n  Montare con:")
@@ -593,13 +710,13 @@ class WazuhImmutableStore:
             mount_opts = self.models['qnap'].mount_options
             host = self.models['qnap'].host
             export = self.models['qnap'].export_path
-            mount_point = self.models['qnap'].mount_point
+            mount_point = self._mount_point()
             print(f"  sudo mount -t nfs -o vers={nfs_ver},{mount_opts} {host}:{export} {mount_point}")
             return False
 
         # Test 3: Check write permissions
         print("\n[3/4] Testing write permissions...")
-        test_file = self.models['qnap'].mount_point / '.wazuh-test-write'
+        test_file = self._mount_point() / '.wazuh-test-write'
         try:
             test_file.write_text("test")
             test_file.unlink()

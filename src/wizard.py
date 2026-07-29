@@ -249,9 +249,9 @@ Expire-Date: 0
         self.print_step(1, total_steps, "Configurazione Sorgente Wazuh")
         self.configure_wazuh()
 
-        # Step 2: QNAP Connection
-        self.print_step(2, total_steps, "Connessione QNAP NFS")
-        self.configure_qnap()
+        # Step 2: Storage backend (QNAP NFS / Generic NFS / MinIO S3)
+        self.print_step(2, total_steps, "Backend di Storage")
+        self.configure_storage()
 
         # Step 3: Archive Settings
         self.print_step(3, total_steps, "Impostazioni Archivio")
@@ -312,6 +312,285 @@ Expire-Date: 0
         }
 
         self.print_success("Configurazione Wazuh completata")
+
+    def configure_storage(self):
+        """Configura il backend di storage (QNAP NFS / Generic NFS / MinIO/S3).
+
+        Imposta:
+          self.config['storage'] = {type, qnap_nfs|generic_nfs|s3: {...}}
+
+        Per backward-compat scrive anche self.config['qnap'] se backend è qnap-nfs.
+        """
+        self.print_info("Scegli dove salvare gli archivi immutabili")
+
+        print("\nBackend supportati:")
+        print(f"  {Colors.OKGREEN}1.{Colors.ENDC} QNAP NFS         — appliance QNAP con WORM firmware (compliance vero)")
+        print(f"  {Colors.OKGREEN}2.{Colors.ENDC} NFS generico     — qualsiasi NFS share (TrueNAS, NetApp, ecc.)")
+        print(f"  {Colors.OKGREEN}3.{Colors.ENDC} MinIO / S3       — bucket S3-compatibile (MinIO/Wasabi/AWS),")
+        print(f"     {' ':10}     Object Lock Compliance opzionale per WORM cloud-native")
+
+        choice = self.ask_choice(
+            "\nQuale backend vuoi configurare?",
+            [
+                "QNAP NFS (default storico)",
+                "NFS generico",
+                "MinIO / S3-compatibile",
+            ],
+            default=0,
+        )
+
+        if choice == "QNAP NFS (default storico)":
+            self.configure_qnap()  # popola self.config['qnap']
+            self.config['storage'] = {
+                'type': 'qnap-nfs',
+                'qnap_nfs': dict(self.config['qnap']),  # copia anche in storage.qnap_nfs
+            }
+        elif choice == "NFS generico":
+            self._configure_generic_nfs()
+        else:
+            self._configure_minio_s3()
+
+        self.print_success(f"Backend configurato: {self.config['storage']['type']}")
+
+    def _configure_generic_nfs(self):
+        """Configura un backend NFS generico (no WORM firmware)."""
+        self.print_info("Configurazione NFS generico — niente WORM applicativo")
+        self.print_warning(
+            "Su NFS generico l'immutabilità reale dipende dal filesystem sottostante. "
+            "Per WORM consigliato: dataset ZFS readonly + snapshot, o appliance compliance."
+        )
+
+        host = self.ask_input(
+            "Indirizzo IP o hostname del server NFS",
+            "",
+            validator=self.validate_ip_or_hostname,
+        )
+        export_path = self.ask_input("Percorso export NFS", "/wazuh-archive")
+        mount_point = self.ask_input("Mount point locale", "/mnt/wazuh-archive")
+
+        nfs_version = self.ask_choice(
+            "Versione NFS:",
+            ["NFSv4 (consigliato)", "NFSv3"],
+            default=0,
+        )
+        nfs_ver_num = 4 if "NFSv4" in nfs_version else 3
+        mount_options = self.ask_input(
+            "Opzioni di mount",
+            "hard,intr,rsize=65536,wsize=65536",
+        )
+
+        idempotent_skip = self.ask_yes_no(
+            "Skip upload se il file remoto esiste già? (utile se la share è readonly o WORM esterno)",
+            default=False,
+        )
+
+        if self.ask_yes_no("Test connessione NFS ora?", default=True):
+            ok = self.test_nfs_connection(host, export_path)
+            if not ok and not self.ask_yes_no("Test fallito. Continuare comunque?", default=False):
+                self.print_warning("Configurazione annullata")
+                return
+
+        self.config['storage'] = {
+            'type': 'generic-nfs',
+            'generic_nfs': {
+                'host': host,
+                'export_path': export_path,
+                'mount_point': mount_point,
+                'nfs_version': nfs_ver_num,
+                'mount_options': mount_options,
+                'idempotent_skip': idempotent_skip,
+            },
+        }
+
+    def _configure_minio_s3(self):
+        """Configura un backend S3-compatibile (MinIO/Wasabi/AWS/R2/B2)."""
+        self.print_info("Configurazione backend S3-compatibile")
+
+        print("\nProfili preconfigurati comuni:")
+        print(f"  {Colors.OKGREEN}1.{Colors.ENDC} MinIO on-prem (http, path-style, no TLS verify)")
+        print(f"  {Colors.OKGREEN}2.{Colors.ENDC} Wasabi cloud (https, EU/US region)")
+        print(f"  {Colors.OKGREEN}3.{Colors.ENDC} AWS S3 ufficiale")
+        print(f"  {Colors.OKGREEN}4.{Colors.ENDC} Custom (inserisci manualmente)")
+
+        profile = self.ask_choice(
+            "\nProfilo:",
+            ["MinIO on-prem", "Wasabi cloud", "AWS S3", "Custom"],
+            default=0,
+        )
+
+        # Defaults in base al profilo
+        if profile == "MinIO on-prem":
+            default_endpoint = "http://192.168.99.118:9000"
+            default_region = "us-east-1"
+            default_path_style = True
+            default_verify_tls = False
+        elif profile == "Wasabi cloud":
+            default_endpoint = "https://s3.eu-central-1.wasabisys.com"
+            default_region = "eu-central-1"
+            default_path_style = False
+            default_verify_tls = True
+        elif profile == "AWS S3":
+            default_endpoint = "https://s3.amazonaws.com"
+            default_region = "eu-west-1"
+            default_path_style = False
+            default_verify_tls = True
+        else:
+            default_endpoint = ""
+            default_region = "us-east-1"
+            default_path_style = True
+            default_verify_tls = True
+
+        endpoint = self.ask_input("Endpoint URL (con http:// o https://)", default_endpoint)
+        bucket = self.ask_input("Nome bucket", "wazuh-archive")
+        region = self.ask_input("Region (cosmetica per MinIO)", default_region)
+
+        path_style = self.ask_yes_no(
+            "Usare path-style addressing? (sì per MinIO/self-hosted, no per AWS reale)",
+            default=default_path_style,
+        )
+        verify_tls = self.ask_yes_no(
+            "Verificare certificato TLS? (no per cert self-signed di POC)",
+            default=default_verify_tls,
+        )
+
+        print(f"\n{Colors.WARNING}Credenziali S3:{Colors.ENDC}")
+        print("Consigliato: usare variabili d'ambiente per non salvare i secret in config.yaml")
+        use_env = self.ask_yes_no("Leggere access_key/secret_key da variabili d'ambiente?", default=True)
+
+        access_key = ""
+        secret_key = ""
+        access_key_env = None
+        secret_key_env = None
+        if use_env:
+            access_key_env = self.ask_input(
+                "Nome env var per access_key", "MINIO_ACCESS_KEY"
+            )
+            secret_key_env = self.ask_input(
+                "Nome env var per secret_key", "MINIO_SECRET_KEY"
+            )
+            self.print_warning(
+                f"Ricorda di esportare {access_key_env} e {secret_key_env} prima di avviare il servizio.\n"
+                f"  Per systemd: aggiungi Environment={access_key_env}=... e Environment={secret_key_env}=...\n"
+                f"  in /etc/systemd/system/wazuh-immutable-store.service.d/credentials.conf"
+            )
+        else:
+            access_key = self.ask_input("Access key (inline, sconsigliato)", "", required=False)
+            secret_key = self.ask_input("Secret key (inline, sconsigliato)", "", required=False)
+
+        # Object Lock
+        print(f"\n{Colors.BOLD}Object Lock (WORM compliance):{Colors.ENDC}")
+        print("Se ATTIVO, ogni oggetto caricato sarà LOCKATO per N giorni.")
+        print("Modalità COMPLIANCE: NESSUNO può cancellare prima della scadenza (neanche root).")
+        print("Modalità GOVERNANCE: utenti con permission speciale possono bypassare.")
+        print("ATTENZIONE: Object Lock deve essere abilitato sul bucket al momento della creazione.")
+
+        use_lock = self.ask_yes_no(
+            "Attivare Object Lock? (richiede bucket con object-lock abilitato)",
+            default=False,
+        )
+
+        retention_mode = "COMPLIANCE"
+        retention_days = 2555
+        if use_lock:
+            mode_choice = self.ask_choice(
+                "Modalità di lock:",
+                ["COMPLIANCE (più rigida)", "GOVERNANCE (più flessibile)"],
+                default=0,
+            )
+            retention_mode = "COMPLIANCE" if "COMPLIANCE" in mode_choice else "GOVERNANCE"
+            retention_days = self.ask_number(
+                "Retention in giorni (2555 = ~7 anni)",
+                default=2555,
+                min_val=1,
+                max_val=36500,
+            )
+
+        organize_by_date = self.ask_yes_no(
+            "Organizzare le key per YYYY/MM/ ?",
+            default=True,
+        )
+        key_prefix = self.ask_input(
+            "Prefisso key opzionale (es. 'wazuh/')",
+            "",
+            required=False,
+        )
+
+        # Test connessione
+        if self.ask_yes_no("Test connessione S3 ora?", default=True):
+            ok = self._test_s3_connection(
+                endpoint, bucket, region,
+                access_key or os.environ.get(access_key_env or "", ""),
+                secret_key or os.environ.get(secret_key_env or "", ""),
+                path_style, verify_tls,
+            )
+            if not ok and not self.ask_yes_no("Test fallito. Continuare comunque?", default=False):
+                self.print_warning("Configurazione annullata")
+                return
+
+        s3_cfg = {
+            'endpoint': endpoint,
+            'bucket': bucket,
+            'region': region,
+            'path_style': path_style,
+            'verify_tls': verify_tls,
+            'use_object_lock': use_lock,
+            'retention_mode': retention_mode,
+            'retention_days': retention_days,
+            'organize_by_date': organize_by_date,
+            'key_prefix': key_prefix,
+        }
+        if use_env:
+            s3_cfg['access_key_env'] = access_key_env
+            s3_cfg['secret_key_env'] = secret_key_env
+        else:
+            s3_cfg['access_key'] = access_key
+            s3_cfg['secret_key'] = secret_key
+
+        self.config['storage'] = {
+            'type': 'minio-s3',
+            's3': s3_cfg,
+        }
+
+    def _test_s3_connection(
+        self,
+        endpoint: str,
+        bucket: str,
+        region: str,
+        access_key: str,
+        secret_key: str,
+        path_style: bool,
+        verify_tls: bool,
+    ) -> bool:
+        """Probe S3 endpoint + bucket access tramite boto3."""
+        if not access_key or not secret_key:
+            self.print_warning("Credenziali non disponibili (env var non esportata?), skip test")
+            return False
+        try:
+            import boto3
+            from botocore.client import Config as BotoConfig
+            client = boto3.client(
+                "s3",
+                endpoint_url=endpoint,
+                aws_access_key_id=access_key,
+                aws_secret_access_key=secret_key,
+                region_name=region,
+                verify=verify_tls,
+                config=BotoConfig(
+                    signature_version="s3v4",
+                    s3={"addressing_style": "path" if path_style else "virtual"},
+                    connect_timeout=10,
+                    read_timeout=30,
+                ),
+            )
+            client.head_bucket(Bucket=bucket)
+            self.print_success(f"Connesso a {endpoint}, bucket '{bucket}' accessibile")
+            return True
+        except ImportError:
+            self.print_error("boto3 non installato. `pip install boto3` per usare backend S3.")
+            return False
+        except Exception as e:
+            self.print_error(f"Test S3 fallito: {e}")
+            return False
 
     def configure_qnap(self):
         """Configure QNAP NFS connection"""
@@ -634,10 +913,28 @@ Expire-Date: 0
         print(f"  Log path: {self.config['wazuh']['logs_path']}")
         print(f"  Include alerts: {self.config['wazuh']['include_alerts']}")
 
-        print(f"\n{Colors.BOLD}QNAP NFS:{Colors.ENDC}")
-        print(f"  Server: {self.config['qnap']['host']}")
-        print(f"  Export: {self.config['qnap']['export_path']}")
-        print(f"  Mount point: {self.config['qnap']['mount_point']}")
+        storage = self.config.get('storage', {})
+        stype = storage.get('type', 'qnap-nfs')
+        print(f"\n{Colors.BOLD}Backend Storage:{Colors.ENDC} {stype}")
+        if stype == 'qnap-nfs':
+            q = storage.get('qnap_nfs') or self.config.get('qnap', {})
+            print(f"  Server: {q.get('host', '?')}")
+            print(f"  Export: {q.get('export_path', '?')}")
+            print(f"  Mount point: {q.get('mount_point', '?')}")
+        elif stype == 'generic-nfs':
+            g = storage.get('generic_nfs', {})
+            print(f"  Server: {g.get('host', '?')}")
+            print(f"  Export: {g.get('export_path', '?')}")
+            print(f"  Mount point: {g.get('mount_point', '?')}")
+            print(f"  WORM applicativo: NO (immutabilità via filesystem esterno)")
+        elif stype in ('minio-s3', 's3-compatible'):
+            s = storage.get('s3', {})
+            print(f"  Endpoint: {s.get('endpoint', '?')}")
+            print(f"  Bucket: {s.get('bucket', '?')}")
+            print(f"  Object Lock: {'COMPLIANCE' if s.get('use_object_lock') else 'OFF'}"
+                  f" {('('+str(s.get('retention_days'))+'gg)') if s.get('use_object_lock') else ''}")
+            ak_src = "env:" + s['access_key_env'] if s.get('access_key_env') else "inline"
+            print(f"  Credenziali: {ak_src}")
 
         print(f"\n{Colors.BOLD}Archivio:{Colors.ENDC}")
         print(f"  Compressione: {self.config['archive']['compression']} (livello {self.config['archive']['compression_level']})")
@@ -705,11 +1002,20 @@ Expire-Date: 0
             return False
 
     def create_directories(self):
-        """Create necessary directories"""
-        dirs = [
-            Path(self.config['archive']['temp_dir']),
-            Path(self.config['qnap']['mount_point']),
-        ]
+        """Create necessary directories (temp_dir + mount_point se backend è NFS-style)."""
+        dirs = [Path(self.config['archive']['temp_dir'])]
+
+        storage = self.config.get('storage', {})
+        stype = storage.get('type', 'qnap-nfs')
+        if stype == 'qnap-nfs':
+            qcfg = storage.get('qnap_nfs') or self.config.get('qnap', {})
+            if qcfg.get('mount_point'):
+                dirs.append(Path(qcfg['mount_point']))
+        elif stype == 'generic-nfs':
+            mp = storage.get('generic_nfs', {}).get('mount_point')
+            if mp:
+                dirs.append(Path(mp))
+        # S3 backend: nessuna dir locale da creare
 
         for d in dirs:
             try:
