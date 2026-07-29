@@ -16,13 +16,31 @@ import hashlib
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
 
-from models import GPGConfig, IntegrityConfig
+from models import ArchiveRecord, ArchiveStatus, GPGConfig, IntegrityConfig
 from signer import SigningManager
 from verify_ledger import VerificationLedger
+
+
+def _manifest_record(name: str, checksum: str = "deadbeef", size: int = 42) -> ArchiveRecord:
+    """Record minimo per popolare il manifest nei test (solo i campi che
+    IntegrityManager.add_manifest_entry legge davvero)."""
+    return ArchiveRecord(
+        id=name,
+        source_files=[],
+        archive_path=Path(name),
+        archive_size=size,
+        checksum=checksum,
+        signature_path=None,
+        created_at=datetime.now(timezone.utc),
+        transferred_at=None,
+        remote_path=None,
+        status=ArchiveStatus.PENDING,
+    )
 
 
 def _sha256_of(path: Path) -> str:
@@ -227,6 +245,99 @@ class TestRotazione(unittest.TestCase):
             secondo_giro = dopo_secondo_giro - primo_giro
             self.assertEqual(len(secondo_giro), 2, dopo_secondo_giro)
             self.assertTrue(primo_giro.isdisjoint(secondo_giro))
+
+
+class ExplodingLedger:
+    """Ledger la cui scrittura fallisce sempre: simula un OSError reale
+    (disco pieno/permessi su /var/lib/wazuh-immutable-store)."""
+
+    def pick_least_recently_verified(self, archive_ids, n):
+        return list(archive_ids)[:n]
+
+    def record_verified(self, archive_ids, when_iso):
+        raise OSError("disco pieno (simulato)")
+
+
+class TestStorageSvuotatoRilevato(unittest.TestCase):
+    """Critical 1: un elenco vuoto NON è automaticamente 'niente da
+    campionare'. Se il manifest registra archivi ma il backend non ne
+    elenca nessuno, è una possibile cancellazione totale e l'esito non può
+    essere valido."""
+
+    def test_manifest_non_vuoto_e_backend_vuoto_e_non_valido(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            sm = _make_signing_manager(base / 'manifests', sample_per_run=5)
+            # Il manifest sa che almeno un archivio esiste...
+            sm.integrity_manager.add_manifest_entry(
+                _manifest_record('wazuh-logs-2026-01-01.tar.gz')
+            )
+
+            backend = FakeBackend([])  # ...ma il backend non ne trova più nessuno.
+
+            valid, results = sm.verify_all_integrity(backend=backend, ledger=None)
+
+            self.assertFalse(valid)
+            self.assertEqual(results['archives_checked'], 0)
+            self.assertTrue(
+                any('cancellazione' in err or 'nessuno' in err
+                    for err in results['archive_errors']),
+                results['archive_errors'],
+            )
+
+    def test_storage_vergine_manifest_vuoto_e_backend_vuoto_e_valido(self):
+        """Se non è mai stato archiviato nulla (manifest vuoto), un elenco
+        vuoto dal backend è coerente: non è un falso allarme."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            sm = _make_signing_manager(base / 'manifests', sample_per_run=5)
+            backend = FakeBackend([])
+
+            valid, results = sm.verify_all_integrity(backend=backend, ledger=None)
+
+            self.assertTrue(valid)
+            self.assertEqual(results['archives_checked'], 0)
+            self.assertEqual(results['archive_errors'], [])
+
+
+class TestLedgerCheFalliceNonPerdeLEsito(unittest.TestCase):
+    """Critical 2: un'eccezione nella scrittura del ledger non deve far
+    perdere l'esito già calcolato del campione (in particolare: la prova di
+    una manomissione appena trovata) né propagare fuori da
+    verify_all_integrity."""
+
+    def test_ledger_che_solleva_non_impedisce_di_ottenere_lesito(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            items = _make_archives(base, 3)
+            # Un archivio manomesso: l'evidenza che NON deve andare persa.
+            manomesso = Path(items[1]['locator'])
+            manomesso.write_bytes(b"contenuto manomesso")
+
+            sm = _make_signing_manager(base / 'manifests', sample_per_run=3)
+            backend = FakeBackend(items)
+
+            # Non deve sollevare, nonostante il ledger fallisca sempre.
+            valid, results = sm.verify_all_integrity(backend=backend, ledger=ExplodingLedger())
+
+            self.assertFalse(valid)  # la manomissione resta rilevata
+            self.assertEqual(results['archives_checked'], 3)
+            self.assertEqual(results['archives_valid'], 2)
+            self.assertTrue(
+                any(manomesso.name in err for err in results['archive_errors'])
+            )
+
+    def test_ledger_che_solleva_con_campione_tutto_integro(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            items = _make_archives(base, 2)
+            sm = _make_signing_manager(base / 'manifests', sample_per_run=2)
+            backend = FakeBackend(items)
+
+            valid, results = sm.verify_all_integrity(backend=backend, ledger=ExplodingLedger())
+
+            self.assertTrue(valid)
+            self.assertEqual(results['archives_checked'], 2)
 
 
 class TestBackendMancanteConCampioneRichiesto(unittest.TestCase):

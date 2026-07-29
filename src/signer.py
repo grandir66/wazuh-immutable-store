@@ -576,7 +576,29 @@ class SigningManager:
             return False
 
         if not archivi:
-            return True  # niente da campionare (storage vuoto)
+            # Un elenco vuoto NON è di per sé prova che non ci sia nulla da
+            # campionare: l'export NFS consente la cancellazione, e un mount
+            # presente ma svuotato (o finito sulla directory sbagliata)
+            # ritorna [] senza sollevare nulla. Trattarlo sempre come "niente
+            # da fare" farebbe passare una cancellazione totale degli archivi
+            # come esito valido — esattamente lo scenario che questa verifica
+            # esiste per rilevare.
+            #
+            # Riferimento per "quanti archivi dovrebbero esserci": il manifest
+            # locale, già caricato in questa stessa chiamata. Se registra
+            # almeno una voce, ci si aspetta almeno un archivio sullo storage;
+            # se non ne trova nessuno, l'esito non può essere valido. Se il
+            # manifest è vuoto (storage vergine, mai archiviato nulla), un
+            # elenco vuoto è coerente e resta valido.
+            entries_attese = self.integrity_manager.get_manifest_entries()
+            if entries_attese:
+                results['archive_errors'].append(
+                    "il manifest registra %d archivi ma il backend non ne "
+                    "elenca nessuno: possibile cancellazione totale dello "
+                    "storage (o mount point sbagliato/svuotato)" % len(entries_attese)
+                )
+                return False
+            return True  # storage vergine: nessun archivio mai registrato
 
         by_id = {a['name']: a for a in archivi if a.get('name')}
         tutti_gli_id = list(by_id.keys())
@@ -601,7 +623,22 @@ class SigningManager:
         if ledger is not None and scelti:
             # Si registra il TENTATIVO per tutti gli scelti (validi o no):
             # vedi VerificationLedger.record_verified per il perché.
-            ledger.record_verified(scelti, _now_iso())
+            #
+            # Il ledger è osservabilità per la rotazione, NON il dato: un
+            # OSError qui (disco pieno, permessi su /var/lib/...) non deve
+            # far perdere l'esito appena calcolato (che può contenere la
+            # prova di una manomissione appena trovata). Stessa filosofia
+            # già applicata alla replica del manifest e alle scritture di
+            # stato: logga e prosegui, il chiamante riceve comunque
+            # `tutti_validi` e può scriverlo nello stato.
+            try:
+                ledger.record_verified(scelti, _now_iso())
+            except Exception as e:
+                logger.warning(
+                    "Impossibile aggiornare il registro di rotazione delle "
+                    "verifiche (%s): l'esito del campione resta valido, solo "
+                    "la rotazione futura ne risente." % e
+                )
 
         return tutti_validi
 
@@ -622,8 +659,12 @@ class SigningManager:
             if not archive_path.exists():
                 return False, [f"archivio non trovato sullo storage: {archive_path}"]
 
-            if not self.integrity_manager.verify_checksum_file(archive_path):
-                errors.append("sha256 ricalcolato non corrisponde al file .sha256 accanto")
+            algoritmo = self.integrity_manager.algorithm
+            checksum_path = archive_path.with_suffix(archive_path.suffix + f'.{algoritmo}')
+            if not checksum_path.exists():
+                errors.append(f"file .{algoritmo} mancante accanto all'archivio")
+            elif not self.integrity_manager.verify_checksum_file(archive_path, checksum_path):
+                errors.append(f"{algoritmo} ricalcolato non corrisponde al file .{algoritmo} accanto")
 
             if self.gpg_signer and self.gpg_signer.enabled:
                 sig_path = archive_path.with_suffix(archive_path.suffix + '.sig')
