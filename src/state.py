@@ -28,6 +28,40 @@ def _now_iso():
     return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
 
+def atomic_write_json(path, payload, tmp_prefix='.tmp-', chmod=None):
+    # type: (Path, dict, str, Optional[int]) -> None
+    """Scrive `payload` come JSON in `path` in modo atomico.
+
+    Tecnica: file temporaneo nella STESSA directory di `path` (necessario
+    perché `os.replace` è atomico solo sullo stesso filesystem), `fsync`
+    prima del rename, poi `os.replace`. Nessun lettore concorrente vede mai
+    un file a metà, e uno scrittore interrotto a metà lascia al più un file
+    `.tmp` orfano accanto a `path`, mai `path` corrotto.
+
+    Condivisa da `StateStore` (stato osservabile) e da qualunque altro
+    registro locale con lo stesso bisogno (es. il ledger delle verifiche in
+    `verify_ledger.py`): la tecnica è una sola, non va reinventata a ogni
+    nuovo file.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=tmp_prefix, suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+            json.dump(payload, fh, indent=2, ensure_ascii=False)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, path)
+        if chmod is not None:
+            os.chmod(path, chmod)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
 def empty_state(host=None):
     # type: (Optional[str]) -> dict
     """Scheletro dello stato: tutte le sezioni presenti, nessun dato."""
@@ -163,20 +197,4 @@ class StateStore(object):
         # type: (dict) -> None
         stato['schema_version'] = STATE_SCHEMA_VERSION
         stato['generated_at'] = _now_iso()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        # Scrittura atomica: file temporaneo nella STESSA directory (rename è
-        # atomico solo sullo stesso filesystem), fsync, poi rename.
-        fd, tmp_name = tempfile.mkstemp(dir=str(self.path.parent), prefix='.state-', suffix='.tmp')
-        try:
-            with os.fdopen(fd, 'w', encoding='utf-8') as fh:
-                json.dump(stato, fh, indent=2, ensure_ascii=False)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp_name, self.path)
-            os.chmod(self.path, 0o640)
-        except Exception:
-            try:
-                os.unlink(tmp_name)
-            except OSError:
-                pass
-            raise
+        atomic_write_json(self.path, stato, tmp_prefix='.state-', chmod=0o640)
