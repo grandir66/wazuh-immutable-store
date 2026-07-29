@@ -913,6 +913,7 @@ Comandi disponibili:
   stats           Mostra statistiche degli archivi
   analyze         Analizza log storici Wazuh
   cleanup         Pulisce log locali già archiviati su WORM
+  serve           Espone lo stato via HTTPS (sola lettura)
 
 Esempi:
   wazuh-immutable-store menu                     # Menu interattivo
@@ -938,7 +939,7 @@ Esempi:
     parser.add_argument('command', nargs='?', default='menu',
                         choices=['menu', 'setup', 'archive', 'retention', 'verify',
                                  'recover', 'list', 'status', 'test', 'browse', 'stats',
-                                 'analyze', 'cleanup'],
+                                 'analyze', 'cleanup', 'serve'],
                         help='Comando da eseguire')
 
     parser.add_argument('-c', '--config', type=Path,
@@ -974,6 +975,19 @@ Esempi:
     parser.add_argument('--write-state', action='store_true',
                         help='(status) Aggiorna il file di stato senza stampare a schermo (uso: timer di rinfresco)')
 
+    parser.add_argument('--host', default='0.0.0.0',
+                        help='(serve) Indirizzo su cui ascoltare')
+    parser.add_argument('--port', type=int, default=9443,
+                        help='(serve) Porta su cui ascoltare')
+    parser.add_argument('--cert', default='/etc/wazuh-immutable-store/status-cert.pem',
+                        help='(serve) Percorso del certificato TLS')
+    parser.add_argument('--key', default='/etc/wazuh-immutable-store/status-key.pem',
+                        help='(serve) Percorso della chiave privata TLS')
+    parser.add_argument('--token-file', default='/etc/wazuh-immutable-store/status-token',
+                        help='(serve) File contenente il token Bearer atteso')
+    parser.add_argument('--state', default='/var/lib/wazuh-immutable-store/state.json',
+                        help='(serve) Percorso del file di stato da esporre')
+
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='Output dettagliato')
 
@@ -999,6 +1013,17 @@ Esempi:
             print("Configurazione non trovata. Avvio wizard di setup...")
             wizard = SetupWizard()
             sys.exit(0 if wizard.run() else 1)
+
+    # Handle serve command - server di sola lettura, non ha bisogno di config.yaml
+    if args.command == 'serve':
+        from status_server import run_status_server
+        try:
+            token = Path(args.token_file).read_text(encoding='utf-8').strip()
+        except Exception as e:
+            print(f"Errore: token non leggibile da {args.token_file}: {e}")
+            sys.exit(1)
+        run_status_server(Path(args.state), token, args.cert, args.key, args.host, args.port)
+        sys.exit(0)
 
     # Load configuration for other commands
     try:
