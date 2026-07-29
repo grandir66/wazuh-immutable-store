@@ -1,0 +1,10 @@
+[Unit]
+Description=Rinfresca lo stato del Wazuh Immutable Store ogni 5 minuti
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

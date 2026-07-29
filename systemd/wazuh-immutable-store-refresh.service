@@ -1,0 +1,8 @@
+[Unit]
+Description=Wazuh Immutable Store - rinfresco dello stato
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/bin/wazuh-immutable-store status --write-state
+SyslogIdentifier=wazuh-immutable-store-refresh

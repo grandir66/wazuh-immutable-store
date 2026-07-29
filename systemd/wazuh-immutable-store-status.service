@@ -1,0 +1,28 @@
+[Unit]
+Description=Wazuh Immutable Store - endpoint di stato (sola lettura)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wis-status
+Group=wis-status
+ExecStart=/usr/local/bin/wazuh-immutable-store serve
+Restart=on-failure
+RestartSec=10
+SyslogIdentifier=wazuh-immutable-store-status
+
+# Il server legge un solo file e non esegue nulla: si può stringere parecchio.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+MemoryDenyWriteExecute=yes
+ReadOnlyPaths=/var/lib/wazuh-immutable-store /etc/wazuh-immutable-store /opt/wazuh-immutable-store
+
+[Install]
+WantedBy=multi-user.target
