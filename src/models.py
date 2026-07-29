@@ -127,6 +127,17 @@ class IntegrityConfig:
     algorithm: str = "sha256"
     create_manifest: bool = True
     chain_manifests: bool = True
+    # Quanti archivi rileggere/ricontrollare (sha256 + firma) a ogni `verify`,
+    # a rotazione sui meno recentemente controllati. 0 disabilita il
+    # campionamento: la verifica valida solo la catena dei manifest (comportamento
+    # legacy, prima che venisse chiuso il TODO "verificare anche i singoli archivi").
+    sample_per_run: int = 10
+    # Cadenza dichiarata del comando `verify` (es. "daily", "weekly",
+    # "every_3_days"): puramente descrittiva, esposta nello stato osservabile
+    # (`schedule.verify_interval`) così un consumatore esterno può stimare se
+    # una verifica è in ritardo. Non pilota alcun timer: l'operatore la tiene
+    # allineata al timer systemd installato.
+    interval: str = "weekly"
 
 
 @dataclass
@@ -149,6 +160,10 @@ class RetentionConfig:
     """Retention policies"""
     local: LocalRetention = field(default_factory=LocalRetention)
     remote: RemoteRetention = field(default_factory=RemoteRetention)
+    # Cadenza dichiarata del comando `retention` (stesso ruolo/formato di
+    # IntegrityConfig.interval per `verify`): descrittiva, esposta in
+    # `schedule.retention_interval`, non pilota alcun timer.
+    interval: str = "daily"
 
 
 @dataclass

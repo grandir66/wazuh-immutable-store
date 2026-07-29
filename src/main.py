@@ -33,6 +33,7 @@ from state import (
     StateStore, classify_archive_outcome, creation_only_failure,
     registra_esito_archive_stato,
 )
+from verify_ledger import VerificationLedger
 
 
 # Configure logging
@@ -192,7 +193,9 @@ class ConfigLoader:
         models['integrity'] = IntegrityConfig(
             algorithm=integrity.get('algorithm', 'sha256'),
             create_manifest=integrity.get('create_manifest', True),
-            chain_manifests=integrity.get('chain_manifests', True)
+            chain_manifests=integrity.get('chain_manifests', True),
+            sample_per_run=integrity.get('sample_per_run', 10),
+            interval=integrity.get('interval', 'weekly')
         )
 
         # Retention config
@@ -208,7 +211,8 @@ class ConfigLoader:
             remote=RemoteRetention(
                 days=remote.get('days', 2555),
                 organize_by_date=remote.get('organize_by_date', True)
-            )
+            ),
+            interval=retention.get('interval', 'daily')
         )
 
         return models
@@ -353,12 +357,39 @@ class WazuhImmutableStore:
                 self._auto_cleanup_local(backend)
 
         esito = classify_archive_outcome(connesso or dry_run, len(records), successful, failed)
+
+        # La catena dei manifest vive SOLO su disco locale (temp_dir), fuori
+        # dallo storage immutabile: una pulizia di quella directory cancella
+        # l'unica prova di integrità esistente. Replicarla è best-effort e non
+        # deve mai far fallire un ciclo già riuscito (è prova aggiuntiva, non
+        # il dato): per questo non tocca `esito`.
+        if not dry_run and esito in ('success', 'partial'):
+            self._replicate_manifest_chain(backend, signing_manager.integrity_manager.manifest_file)
+
         self._registra_esito_archive(
             avviato_il, esito, len(records), successful, failed, bytes_caricati, None,
             dry_run=dry_run,
         )
         logger.info(f"Ciclo di archiviazione concluso: esito {esito}")
         return esito
+
+    def _replicate_manifest_chain(self, backend: StorageBackend, manifest_path: Path):
+        """Copia il manifest.log sullo storage immutabile via il backend.
+
+        Best-effort: se fallisce, logga e prosegue. Non cancella né sovrascrive
+        nient'altro sullo storage (il backend scrive sempre e solo su quel
+        singolo file remoto dedicato).
+        """
+        try:
+            if backend.replicate_manifest(manifest_path):
+                logger.info(f"Manifest replicato sullo storage immutabile: {manifest_path.name}")
+            else:
+                logger.warning(
+                    "Replica del manifest sullo storage non riuscita "
+                    "(backend non la supporta o errore, vedi log precedenti)"
+                )
+        except Exception as e:
+            logger.warning(f"Replica del manifest sullo storage fallita: {e}")
 
     def _registra_esito_archive(self, avviato_il, esito, creati, caricati,
                                 falliti, byte_caricati, errore, dry_run=False):
@@ -453,7 +484,14 @@ class WazuhImmutableStore:
         return esito
 
     def verify_integrity(self):
-        """Verify integrity of all archives"""
+        """Verify integrity of all archives.
+
+        Oltre alla catena dei manifest, rilegge a rotazione un campione di
+        archivi dallo storage (sha256 ricalcolato + firma GPG): vedi
+        `SigningManager.verify_all_integrity`. Un backend non raggiungibile
+        non fa fallire il comando con un'eccezione: viene registrato come
+        errore di verifica (il campionamento richiesto non è stato possibile).
+        """
         logger.info("Starting integrity verification...")
 
         manifest_dir = self.models['archive'].temp_dir / 'manifests'
@@ -463,7 +501,15 @@ class WazuhImmutableStore:
             manifest_dir
         )
 
-        valid, results = signing_manager.verify_all_integrity()
+        backend: Optional[StorageBackend] = None
+        try:
+            backend = get_backend(self.models['storage'], self.models['retention'].remote)
+        except StorageBackendError as e:
+            logger.warning(f"Backend non disponibile per il campionamento della verifica: {e}")
+
+        ledger = VerificationLedger()
+
+        valid, results = signing_manager.verify_all_integrity(backend=backend, ledger=ledger)
 
         if valid:
             logger.info("All integrity checks passed")
@@ -479,6 +525,7 @@ class WazuhImmutableStore:
                 'archives_checked': results.get('archives_checked', 0),
                 'archives_valid': results.get('archives_valid', 0),
                 'errors': results.get('chain_errors', []),
+                'archive_errors': results.get('archive_errors', []),
             })
         except Exception as e:
             logger.warning(f"Impossibile aggiornare il file di stato: {e}")
@@ -831,7 +878,16 @@ class WazuhImmutableStore:
         except Exception as e:
             logger.warning(f"Statistiche archivi non disponibili: {e}")
 
-        pianificazione = {'archive_interval': self.models['archive'].interval.value}
+        # I tre `_interval` sono descrittivi (presi dal modello di config di
+        # ciascun ciclo, stesso formato stringa), non letti dai timer systemd:
+        # servono a chi osserva lo stato per stimare se un ciclo è in ritardo o
+        # semplicemente non è ancora il suo turno, cosa che senza questo dato
+        # deve indovinare.
+        pianificazione = {
+            'archive_interval': self.models['archive'].interval.value,
+            'verify_interval': self.models['integrity'].interval,
+            'retention_interval': self.models['retention'].interval,
+        }
 
         try:
             self.state.update_live(backend_info, disco_locale, archivi, pianificazione)

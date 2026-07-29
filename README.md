@@ -545,6 +545,11 @@ integrity:
   algorithm: sha256
   create_manifest: true
   chain_manifests: true
+  sample_per_run: 10   # archivi riletti/ricontrollati (sha256 + firma) a ogni `verify`,
+                       # a rotazione sui meno recentemente verificati. 0 disattiva il
+                       # campionamento: solo la catena dei manifest viene validata.
+  interval: weekly     # cadenza dichiarata del comando `verify` (descrittiva:
+                       # esposta nello stato osservabile, non pilota il timer systemd)
 
 # Retention
 retention:
@@ -555,6 +560,8 @@ retention:
   remote:
     days: 2555  # 7 anni
     organize_by_date: true
+  interval: daily      # cadenza dichiarata del comando `retention` (descrittiva,
+                       # stesso ruolo di integrity.interval)
 
 # Schedulazione
 schedule:

@@ -376,7 +376,7 @@ Tutti i comandi sono non distruttivi: la verifica non altera in alcun modo gli a
 sudo wazuh-immutable-store verify
 ```
 
-Esegue: verifica firma GPG di tutti gli archivi, controllo SHA-256 di ciascun archivio rispetto al companion `.sha256`, validazione della chain di hash concatenati nel manifest globale.
+Esegue: validazione della chain di hash concatenati nel manifest globale, PIÙ la rilettura reale di un campione di archivi (default `integrity.sample_per_run: 10`, configurabile in `config.yaml`): per ciascuno, ricalcolo dello SHA-256 confrontato col companion `.sha256` e verifica della firma GPG `.sig`. Il campione ruota sugli archivi meno recentemente controllati (registro in `/var/lib/wazuh-immutable-store/verify-ledger.json`), così nel tempo la copertura arriva a coprire l'intero storage invece di validare sempre e solo la catena. `sample_per_run: 0` disattiva il campionamento (solo catena, comportamento legacy).
 
 Esito atteso: `All integrity checks passed`.
 
