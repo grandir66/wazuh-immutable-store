@@ -10,7 +10,7 @@ import logging
 import time
 import yaml
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -29,6 +29,7 @@ from historical import HistoricalArchiveManager, HistoricalLogsScanner, WazuhLog
 from wizard import SetupWizard
 from menu import InteractiveMenu
 from storage_backends import get_backend, StorageBackend, StorageBackendError
+from state import StateStore, classify_archive_outcome
 
 
 # Configure logging
@@ -217,6 +218,7 @@ class WazuhImmutableStore:
         self.config_path = config_path
         self.config = None
         self.models = None
+        self.state = StateStore()
 
     def load_config(self):
         """Load configuration"""
@@ -247,6 +249,10 @@ class WazuhImmutableStore:
         """
         logger.info("Starting archive cycle...")
 
+        avviato_il = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        connesso = False
+        bytes_caricati = 0
+
         backend: StorageBackend = get_backend(
             self.models['storage'],
             self.models['retention'].remote,
@@ -269,10 +275,11 @@ class WazuhImmutableStore:
         )
 
         if not records:
-            logger.info("No archives created")
+            logger.info("Nessun archivio da creare")
             if auto_cleanup and not dry_run:
                 self._auto_cleanup_local(backend)
-            return
+            self._registra_esito_archive(avviato_il, 'success', 0, 0, 0, 0, None)
+            return 'success'
 
         # Sign archives (backend-agnostic)
         manifest_dir = self.models['archive'].temp_dir / 'manifests'
@@ -293,8 +300,13 @@ class WazuhImmutableStore:
         failed = 0
         if not dry_run:
             if not backend.connect():
-                logger.error(f"Backend {backend.type_name} connect failed; abort transfer")
-                return
+                messaggio = f"Backend {backend.type_name} non raggiungibile: trasferimento annullato"
+                logger.error(messaggio)
+                self._registra_esito_archive(
+                    avviato_il, 'failed', len(records), 0, len(records), 0, messaggio
+                )
+                return 'failed'
+            connesso = True
 
             # Retry con backoff: ripristina il comportamento pre-astrazione backend.
             # Un intoppo NFS transitorio non deve trasformarsi in un ciclo fallito.
@@ -317,12 +329,35 @@ class WazuhImmutableStore:
                             logger.error(f"Upload fallito definitivamente per {record.id}: {e}")
                             failed += 1
 
-            logger.info(f"Transfer complete: {successful} successful, {failed} failed")
+            logger.info(f"Trasferimento completato: {successful} riusciti, {failed} falliti")
 
             if auto_cleanup and successful > 0:
                 self._auto_cleanup_local(backend)
 
-        logger.info("Archive cycle complete")
+        esito = classify_archive_outcome(connesso or dry_run, len(records), successful, failed)
+        self._registra_esito_archive(
+            avviato_il, esito, len(records), successful, failed, bytes_caricati, None
+        )
+        logger.info(f"Ciclo di archiviazione concluso: esito {esito}")
+        return esito
+
+    def _registra_esito_archive(self, avviato_il, esito, creati, caricati,
+                                falliti, byte_caricati, errore):
+        """Scrive nel file di stato l'esito del ciclo di archiviazione."""
+        try:
+            self.state.update_section('archive', {
+                'last_started_at': avviato_il,
+                'last_finished_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'outcome': esito,
+                'archives_created': creati,
+                'uploaded': caricati,
+                'failed': falliti,
+                'bytes_uploaded': byte_caricati,
+                'error': errore,
+            })
+        except Exception as e:
+            # Lo stato è osservabilità: un suo problema non deve far fallire l'archiviazione.
+            logger.warning(f"Impossibile aggiornare il file di stato: {e}")
 
     def _auto_cleanup_local(self, backend: Optional[StorageBackend] = None):
         """Automatically cleanup local Wazuh logs that have been archived.
@@ -388,6 +423,19 @@ class WazuhImmutableStore:
                     f"{report.local_files_deleted} files deleted, "
                     f"{report.local_space_freed / (1024*1024):.2f} MB freed")
 
+        errors_count = len(report.errors)
+        try:
+            self.state.update_section('retention', {
+                'last_finished_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'outcome': 'success' if errors_count == 0 else 'failed',
+                'local_files_deleted': report.local_files_deleted,
+                'space_freed_mb': round(report.local_space_freed / (1024 * 1024), 2),
+                'errors_count': errors_count,
+                'error': None,
+            })
+        except Exception as e:
+            logger.warning(f"Impossibile aggiornare il file di stato: {e}")
+
     def verify_integrity(self):
         """Verify integrity of all archives"""
         logger.info("Starting integrity verification...")
@@ -406,6 +454,18 @@ class WazuhImmutableStore:
         else:
             logger.error("Integrity verification failed")
             logger.error(f"Errors: {results}")
+
+        try:
+            self.state.update_section('verify', {
+                'last_finished_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'outcome': 'success' if valid else 'failed',
+                'manifest_chain_valid': results.get('manifest_chain_valid', False),
+                'archives_checked': results.get('archives_checked', 0),
+                'archives_valid': results.get('archives_valid', 0),
+                'errors': results.get('chain_errors', []),
+            })
+        except Exception as e:
+            logger.warning(f"Impossibile aggiornare il file di stato: {e}")
 
         return valid
 
@@ -878,7 +938,10 @@ Esempi:
     # Execute command
     try:
         if args.command == 'archive':
-            app.run_archive(dry_run=args.dry_run, auto_cleanup=not args.no_cleanup)
+            esito = app.run_archive(dry_run=args.dry_run, auto_cleanup=not args.no_cleanup)
+            # Prima di questa modifica il comando usciva sempre con 0, anche con il
+            # NAS irraggiungibile: systemctl riportava "success" senza aver replicato nulla.
+            sys.exit(0 if esito == 'success' else 1)
 
         elif args.command == 'retention':
             app.run_retention(dry_run=args.dry_run)
