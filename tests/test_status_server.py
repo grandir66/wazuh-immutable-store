@@ -71,6 +71,44 @@ class TestStatusServer(unittest.TestCase):
             urllib.request.urlopen(req, timeout=5)
         self.assertIn(ctx.exception.code, (404, 405))
 
+    def test_options_non_in_allowlist_e_404_senza_rivelare_nulla(self):
+        req = urllib.request.Request(f'http://127.0.0.1:{self.port}/status', method='OPTIONS')
+        req.add_header('Authorization', f'Bearer {TOKEN}')
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(req, timeout=5)
+        self.assertEqual(ctx.exception.code, 404)
+        corpo = ctx.exception.read()
+        # Niente pagina HTML della stdlib, niente nome del verbo non supportato.
+        self.assertNotIn(b'<html', corpo.lower())
+        self.assertNotIn(b'OPTIONS', corpo)
+
+    def test_verbo_arbitrario_e_404(self):
+        req = urllib.request.Request(f'http://127.0.0.1:{self.port}/status', method='PROPFIND')
+        req.add_header('Authorization', f'Bearer {TOKEN}')
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(req, timeout=5)
+        self.assertEqual(ctx.exception.code, 404)
+
+    def test_token_non_ascii_e_401_pulito(self):
+        req = urllib.request.Request(f'http://127.0.0.1:{self.port}/status')
+        req.add_header('Authorization', 'Bearer caffè')
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(req, timeout=5)
+        self.assertEqual(ctx.exception.code, 401)
+
+    def test_bearer_vuoto_e_401(self):
+        req = urllib.request.Request(f'http://127.0.0.1:{self.port}/status')
+        req.add_header('Authorization', 'Bearer ')
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(req, timeout=5)
+        self.assertEqual(ctx.exception.code, 401)
+
+    def test_head_su_health_e_200_senza_corpo(self):
+        req = urllib.request.Request(f'http://127.0.0.1:{self.port}/health', method='HEAD')
+        r = urllib.request.urlopen(req, timeout=5)
+        self.assertEqual(r.status, 200)
+        self.assertEqual(r.read(), b'')
+
 
 if __name__ == '__main__':
     unittest.main()
