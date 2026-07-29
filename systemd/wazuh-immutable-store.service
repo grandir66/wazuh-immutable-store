@@ -31,6 +31,7 @@ ReadWritePaths=/tmp/wazuh-archive
 ReadWritePaths=/var/log
 ReadWritePaths=/etc/wazuh-immutable-store
 ReadWritePaths=/mnt/qnap-wazuh
+ReadWritePaths=/var/lib/wazuh-immutable-store
 
 # Resource limits
 MemoryMax=2G

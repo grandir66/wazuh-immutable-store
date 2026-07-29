@@ -498,6 +498,11 @@ class ArchiveManager:
         self.archive_config = archive_config
         self.records: List[ArchiveRecord] = []
         self.remote_mount_point = remote_mount_point
+        # Contatore di errori di CREAZIONE (ArchiveError inghiottiti in
+        # run_archive_cycle). Azzerato a ogni ciclo: permette al chiamante di
+        # distinguere "niente da archiviare" (creation_errors == 0) da "tutte
+        # le creazioni sono fallite" (records vuoto MA creation_errors > 0).
+        self.creation_errors: int = 0
 
     def _check_archive_exists_remote(self, archive_date: datetime) -> bool:
         """
@@ -535,6 +540,7 @@ class ArchiveManager:
             List of created archive records
         """
         logger.info("Starting archive cycle")
+        self.creation_errors = 0
 
         # Find files to archive
         files = self.collector.find_logs_to_archive(min_age_days)
@@ -568,6 +574,7 @@ class ArchiveManager:
 
             except ArchiveError as e:
                 logger.error(f"Failed to create archive for {group_date}: {e}")
+                self.creation_errors += 1
                 continue
 
         if skipped_count > 0:

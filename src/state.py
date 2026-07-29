@@ -61,6 +61,55 @@ def classify_archive_outcome(connected, created, uploaded, failed):
     return 'success'
 
 
+def creation_only_failure(records_created, creation_errors):
+    # type: (int, int) -> bool
+    """
+    True quando il ciclo non ha prodotto NESSUN archivio a causa di errori di
+    creazione, non perché non c'era nulla da archiviare.
+
+    Prima di questa funzione, `run_archive_cycle` inghiottiva `ArchiveError`
+    con un semplice `continue`: se TUTTE le creazioni fallivano (es. disco
+    temporaneo pieno), il ciclo tornava una lista vuota indistinguibile dal
+    caso "niente da fare", e il comando registrava/usciva come successo.
+    """
+    return records_created == 0 and creation_errors > 0
+
+
+def registra_esito_archive_stato(state, dry_run, avviato_il, esito, creati,
+                                  caricati, falliti, byte_caricati, errore):
+    # type: (StateStore, bool, str, str, int, int, int, int, Optional[str]) -> None
+    """Scrive nel file di stato l'esito del ciclo di archiviazione.
+
+    In dry-run non scrive NULLA: il dry-run osserva soltanto, non deve alterare
+    lo stato reale. Senza questa guardia, un operatore che lancia un dry-run
+    dopo un ciclo fallito vero cancellerebbe l'allarme fino al ciclo reale
+    successivo (l'esito 'success, uploaded: 0' del dry-run sovrascriverebbe
+    quello 'failed' precedente).
+
+    Estratta a livello di funzione di modulo (invece che come metodo dipendente
+    da un'istanza App completa, che richiede config/yaml non sempre
+    disponibili) per essere testabile in isolamento con una StateStore vera
+    puntata su un path temporaneo.
+    """
+    if dry_run:
+        logger.info("dry-run: stato archiviazione non aggiornato (nessuna modifica reale)")
+        return
+    try:
+        state.update_section('archive', {
+            'last_started_at': avviato_il,
+            'last_finished_at': _now_iso(),
+            'outcome': esito,
+            'archives_created': creati,
+            'uploaded': caricati,
+            'failed': falliti,
+            'bytes_uploaded': byte_caricati,
+            'error': errore,
+        })
+    except Exception as e:
+        # Lo stato è osservabilità: un suo problema non deve far fallire l'archiviazione.
+        logger.warning("Impossibile aggiornare il file di stato: %s" % e)
+
+
 class StateStore(object):
     """Legge e aggiorna il file di stato. Ogni scrittura è atomica."""
 

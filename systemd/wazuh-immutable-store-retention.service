@@ -25,6 +25,7 @@ PrivateTmp=yes
 ReadWritePaths=/tmp/wazuh-archive
 ReadWritePaths=/var/log
 ReadWritePaths=/etc/wazuh-immutable-store
+ReadWritePaths=/var/lib/wazuh-immutable-store
 
 [Install]
 WantedBy=multi-user.target
