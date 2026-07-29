@@ -297,6 +297,15 @@ class WazuhImmutableStore:
             logger.info("Nessun archivio da creare")
             if auto_cleanup and not dry_run:
                 self._auto_cleanup_local(backend)
+            # Anche qui va replicata la catena: su un'installazione a regime
+            # "nessun archivio da creare" è il caso NORMALE (i log di oggi non
+            # sono ancora maturi), quindi replicare solo quando si producono
+            # archivi nuovi significa, in pratica, non replicare mai — e la
+            # catena resterebbe l'unica copia, su disco locale.
+            if not dry_run:
+                self._replicate_manifest_chain(
+                    backend, self.models['archive'].temp_dir / 'manifests' / 'manifest.log'
+                )
             self._registra_esito_archive(
                 avviato_il, 'success', 0, 0, 0, 0, None, dry_run=dry_run
             )
