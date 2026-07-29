@@ -7,6 +7,7 @@ Punto di ingresso principale per il sistema di archiviazione
 import argparse
 import sys
 import logging
+import time
 import yaml
 import json
 from datetime import datetime, timedelta
@@ -295,14 +296,26 @@ class WazuhImmutableStore:
                 logger.error(f"Backend {backend.type_name} connect failed; abort transfer")
                 return
 
+            # Retry con backoff: ripristina il comportamento pre-astrazione backend.
+            # Un intoppo NFS transitorio non deve trasformarsi in un ciclo fallito.
+            max_retries = 3
             for record in records:
-                try:
-                    locator = backend.upload_archive(record)
-                    logger.info(f"Uploaded ({backend.type_name}): {locator}")
-                    successful += 1
-                except StorageBackendError as e:
-                    logger.error(f"Upload failed for {record.id}: {e}")
-                    failed += 1
+                for tentativo in range(1, max_retries + 1):
+                    try:
+                        locator = backend.upload_archive(record)
+                        logger.info(f"Uploaded ({backend.type_name}): {locator}")
+                        successful += 1
+                        break
+                    except StorageBackendError as e:
+                        if tentativo < max_retries:
+                            logger.warning(
+                                f"Upload fallito per {record.id}, ritento "
+                                f"({tentativo}/{max_retries}): {e}"
+                            )
+                            time.sleep(5 * tentativo)
+                        else:
+                            logger.error(f"Upload fallito definitivamente per {record.id}: {e}")
+                            failed += 1
 
             logger.info(f"Transfer complete: {successful} successful, {failed} failed")
 

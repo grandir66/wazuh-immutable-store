@@ -24,6 +24,16 @@ if TYPE_CHECKING:
 
 _SUPPORTED_TYPES = ("qnap-nfs", "generic-nfs", "minio-s3", "s3-compatible")
 
+# Backend non ancora pronti per la produzione: retention va in errore con mount
+# point nullo, il cleanup dei log locali non avviene mai (disco che si riempie),
+# i comandi di lettura ignorano il backend e boto3 non è tra le dipendenze.
+# Meglio rifiutare all'avvio con un messaggio chiaro che rompersi a metà run.
+_BACKEND_NON_PRONTI = {
+    'generic-nfs': 'retention e cleanup locale non implementati per questo backend',
+    's3-compatible': 'retention, cleanup locale e comandi di lettura non implementati; boto3 non dichiarato',
+    'minio-s3': 'retention, cleanup locale e comandi di lettura non implementati; boto3 non dichiarato',
+}
+
 
 def get_backend(
     storage_config: "StorageConfig",
@@ -36,8 +46,16 @@ def get_backend(
         remote_retention: politica retention remota (usata da NFS-style backend)
 
     Raises:
-        StorageBackendError: tipo non supportato o config mancante per il tipo.
+        StorageBackendError: tipo non supportato, non pronto per produzione,
+            o config mancante per il tipo.
     """
+    motivo = _BACKEND_NON_PRONTI.get(storage_config.type)
+    if motivo:
+        raise StorageBackendError(
+            f"Il backend '{storage_config.type}' non è pronto per l'uso: {motivo}. "
+            "Usa 'qnap-nfs' finché non viene completato."
+        )
+
     btype = storage_config.type
 
     if btype == "qnap-nfs":
