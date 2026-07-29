@@ -753,6 +753,80 @@ class WazuhImmutableStore:
 
         print("\n" + "=" * 60)
 
+    def write_live_state(self) -> None:
+        """
+        Aggiorna le parti vive del file di stato.
+
+        Tutti i dati provengono da dizionari già calcolati altrove: qui si
+        raccolgono e si serializzano, senza logica nuova. Pensato per essere
+        invocato da un timer periodico (`status --write-state`): non deve mai
+        stampare a schermo né uscire con eccezione, anche se il backend non
+        risponde o gli archivi non sono leggibili.
+        """
+        backend_info = {}
+        disco_locale = {}
+        archivi = {}
+
+        try:
+            backend = get_backend(self.models['storage'], self.models['retention'].remote)
+            raggiungibile, messaggio = backend.health_check()
+            uso = backend.get_disk_usage() or {}
+            backend_info = {
+                'type': backend.type_name,
+                'reachable': bool(raggiungibile),
+                'message': messaggio,
+                'destination': str(backend.local_mount_point) if backend.local_mount_point else None,
+                'disk': uso,
+            }
+        except Exception as e:
+            # Include anche il caso StorageBackendError (backend non pronto,
+            # es. generic-nfs/s3-compatible): non deve far crollare il comando.
+            backend_info = {'reachable': False, 'message': f"Backend non interrogabile: {e}"}
+            logger.warning(f"Backend non interrogabile per lo stato vivo: {e}")
+
+        try:
+            import shutil
+            uso_locale = shutil.disk_usage('/')
+            disco_locale = {
+                'size_gb': round(uso_locale.total / (1024 ** 3), 1),
+                'used_gb': round(uso_locale.used / (1024 ** 3), 1),
+                'available_gb': round(uso_locale.free / (1024 ** 3), 1),
+                'use_percent': round(uso_locale.used * 100 / uso_locale.total),
+            }
+        except Exception as e:
+            logger.warning(f"Spazio disco locale non leggibile: {e}")
+
+        try:
+            recovery = RecoveryManager(
+                self.models['archive'].temp_dir,
+                self._mount_point(),
+                self.models['gpg'],
+                self.models['integrity'],
+            )
+            stat = recovery.get_recovery_statistics()
+            archivi = {
+                'total': stat['total_archives'],
+                'total_size_gb': stat['total_size_gb'],
+                'with_signature': stat['with_signature'],
+                'with_checksum': stat['with_checksum'],
+                'oldest': stat['date_range']['oldest'],
+                'newest': stat['date_range']['newest'],
+            }
+        except Exception as e:
+            logger.warning(f"Statistiche archivi non disponibili: {e}")
+
+        pianificazione = {'archive_interval': self.models['archive'].interval.value}
+
+        try:
+            self.state.update_live(backend_info, disco_locale, archivi, pianificazione)
+            self.state.update_retention_policy({
+                'remote_days': self.models['retention'].remote.days,
+                'mode': backend_info.get('type'),
+            })
+        except Exception as e:
+            # Lo stato è osservabilità: un suo problema non deve far fallire il comando.
+            logger.warning(f"Impossibile aggiornare il file di stato: {e}")
+
     def test_connection(self):
         """Test NFS connection and write permissions"""
         print("\n" + "=" * 60)
@@ -897,6 +971,9 @@ Esempi:
     parser.add_argument('--no-cleanup', action='store_true',
                         help='Disabilita pulizia automatica dopo archiviazione')
 
+    parser.add_argument('--write-state', action='store_true',
+                        help='(status) Aggiorna il file di stato senza stampare a schermo (uso: timer di rinfresco)')
+
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='Output dettagliato')
 
@@ -979,7 +1056,10 @@ Esempi:
             app.show_stats()
 
         elif args.command == 'status':
-            app.check_status()
+            if getattr(args, 'write_state', False):
+                app.write_live_state()
+            else:
+                app.check_status()
 
         elif args.command == 'test':
             success = app.test_connection()
