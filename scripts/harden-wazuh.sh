@@ -274,9 +274,9 @@ EOF
 
   Per ciascun servizio ti chiedo da quale rete/IP deve essere accessibile.
   Formato accettato:
-    - Singola subnet:   ${CYAN}172.16.0.0/16${NC}
-    - Singolo IP:       ${CYAN}172.16.1.20${NC}
-    - Multipli (CSV):   ${CYAN}172.16.0.0/16,172.17.100.0/24,10.0.0.5${NC}
+    - Singola subnet:   ${CYAN}10.10.0.0/16${NC}
+    - Singolo IP:       ${CYAN}10.10.1.20${NC}
+    - Multipli (CSV):   ${CYAN}10.10.0.0/16,10.20.100.0/24,10.0.0.5${NC}
     - Tutti (sconsigliato): ${CYAN}any${NC}
     - Disabilita servizio: ${CYAN}vuoto${NC} (premi solo invio)
 

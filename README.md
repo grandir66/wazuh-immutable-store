@@ -520,7 +520,7 @@ wazuh:
 
 # Connessione QNAP
 qnap:
-  host: 192.168.16.26
+  host: 192.168.1.50            # indirizzo del tuo NAS
   export_path: /wazuh-archive
   mount_point: /mnt/qnap-wazuh
   nfs_version: 3
