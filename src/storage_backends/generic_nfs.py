@@ -8,6 +8,7 @@ Comportamento simile a QNAP ma:
 """
 
 import logging
+import hashlib
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -153,9 +154,21 @@ class GenericNFSStorageBackend(StorageBackend):
                 logger.warning("Replica manifest saltata: mount NFS non disponibile")
                 return False
         try:
-            dest = self._nfs.mount_point / "manifests" / manifest_path.name
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(manifest_path, dest)
+            # Nome derivato dal CONTENUTO, e mai una sovrascrittura: uno storage
+            # immutabile puo' legittimamente rifiutare di riscrivere un file gia'
+            # presente (sul campo: EPERM su un file esistente, mentre crearne uno
+            # nuovo riesce). Versionare e' anche piu' corretto: la catena cresce
+            # e ogni suo stato resta verificabile.
+            digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()[:12]
+            dest_dir = self._nfs.mount_point / "manifests"
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest = dest_dir / f"{manifest_path.stem}-{digest}{manifest_path.suffix}"
+            if dest.exists():
+                return True  # gia' replicato: contenuto identico, niente da fare
+            # copyfile e non copy2: la copia dei metadati fallisce su NFS con
+            # EPERM anche quando il contenuto viene scritto correttamente.
+            shutil.copyfile(manifest_path, dest)
+            logger.info(f"Manifest replicato sullo storage immutabile: {dest.name}")
             return True
         except OSError as e:
             logger.warning(f"Replica manifest fallita: {e}")

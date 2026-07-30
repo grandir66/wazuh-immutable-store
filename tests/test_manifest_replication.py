@@ -85,11 +85,14 @@ class TestReplicateManifestQnap(unittest.TestCase):
             ok = backend.replicate_manifest(manifest)
 
             self.assertTrue(ok)
-            copia = mount / 'manifests' / 'manifest.log'
-            self.assertTrue(copia.exists())
-            self.assertEqual(copia.read_text(), manifest.read_text())
+            copie = list((mount / 'manifests').glob('manifest-*.log'))
+            self.assertEqual(len(copie), 1, f"attesa una sola copia versionata: {copie}")
+            self.assertEqual(copie[0].read_text(), manifest.read_text())
 
-    def test_sovrascrive_solo_il_file_dedicato_niente_altro(self):
+    def test_non_sovrascrive_mai_e_versiona_per_contenuto(self):
+        """Sul campo lo storage immutabile ha rifiutato con EPERM la riscrittura di
+        un manifest gia' presente, mentre creare un file nuovo riusciva: replicare
+        deve quindi versionare, mai sovrascrivere."""
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             mount = root / 'mount'
@@ -101,13 +104,22 @@ class TestReplicateManifestQnap(unittest.TestCase):
             manifest = root / 'manifest.log'
             manifest.write_text("v1\n")
             backend = _qnap_backend(mount)
-            backend.replicate_manifest(manifest)
+            self.assertTrue(backend.replicate_manifest(manifest))
+            prima = sorted((mount / 'manifests').glob('manifest-*.log'))
+            self.assertEqual(len(prima), 1)
 
-            # Una seconda replica con contenuto diverso sovrascrive SOLO il manifest.
+            # Stesso contenuto: nessuna copia nuova, e nessun tentativo di riscrittura.
+            self.assertTrue(backend.replicate_manifest(manifest))
+            self.assertEqual(sorted((mount / 'manifests').glob('manifest-*.log')), prima)
+
+            # Contenuto diverso: nasce una copia NUOVA, la precedente resta intatta.
             manifest.write_text("v1\nv2\n")
-            backend.replicate_manifest(manifest)
+            self.assertTrue(backend.replicate_manifest(manifest))
+            dopo = sorted((mount / 'manifests').glob('manifest-*.log'))
+            self.assertEqual(len(dopo), 2, f"attese due versioni distinte: {dopo}")
+            self.assertEqual(prima[0].read_text(), "v1\n", "la versione precedente e' stata alterata")
+            self.assertEqual({f.read_text() for f in dopo}, {"v1\n", "v1\nv2\n"})
 
-            self.assertEqual((mount / 'manifests' / 'manifest.log').read_text(), "v1\nv2\n")
             self.assertEqual(preesistente.read_bytes(), b"archivio preesistente")
 
     def test_manifest_assente_ritorna_false_senza_sollevare(self):
@@ -131,7 +143,8 @@ class TestReplicateManifestGenericNfs(unittest.TestCase):
             ok = backend.replicate_manifest(manifest)
 
             self.assertTrue(ok)
-            self.assertTrue((mount / 'manifests' / 'manifest.log').exists())
+            copie = list((mount / 'manifests').glob('manifest-*.log'))
+            self.assertEqual(len(copie), 1, f"attesa una sola copia versionata: {copie}")
 
 
 if __name__ == '__main__':
