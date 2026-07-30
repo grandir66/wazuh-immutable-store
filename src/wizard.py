@@ -420,7 +420,7 @@ Expire-Date: 0
 
         # Defaults in base al profilo
         if profile == "MinIO on-prem":
-            default_endpoint = "http://192.168.99.118:9000"
+            default_endpoint = "http://minio.interno.example:9000"
             default_region = "us-east-1"
             default_path_style = True
             default_verify_tls = False

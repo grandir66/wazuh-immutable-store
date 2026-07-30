@@ -74,7 +74,7 @@ class GenericNFSConfig:
 @dataclass
 class S3Config:
     """S3-compatible storage (MinIO, Wasabi, AWS S3, Cloudflare R2, Backblaze B2)."""
-    endpoint: str                       # es: "http://192.168.99.118:9000"
+    endpoint: str                       # es: "http://minio.interno.example:9000"
     bucket: str                         # es: "wazuh-archive"
     access_key: str = ""                # iniettato da env var o keystore
     secret_key: str = ""
