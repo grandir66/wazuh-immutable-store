@@ -179,19 +179,25 @@ class TestRotazioneDuranteArchiviazione(unittest.TestCase):
                      "da root i permessi non bloccano la lettura")
     def test_un_errore_diverso_da_file_mancante_fa_fallire_il_ciclo(self):
         """Permessi negati sul sostituto non devono essere riclassificati come
-        'file in transito' ed esclusi in silenzio."""
+        'file in transito' ed esclusi in silenzio.
+
+        Nel batch DEVE esserci anche un file valido: con un solo file il ciclo
+        fallirebbe comunque per l'interruzione preesistente "nessun file
+        archiviabile", e il test passerebbe anche col difetto reintrodotto.
+        """
         import os
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
+            buono = root / "ossec-alerts-02.json"; buono.write_text("questo si legge\n")
             ruotato = root / "ossec-alerts-01.log"; ruotato.write_text("x\n")
-            lf = _logfile(ruotato)
+            files = [_logfile(buono), _logfile(ruotato)]
             compresso = root / "ossec-alerts-01.log.gz"
             compresso.write_bytes(b"compresso")
             ruotato.unlink()
             os.chmod(compresso, 0o000)
             try:
                 with self.assertRaises(ArchiveError):
-                    _archiver(root).create_archive([lf], datetime(2026, 8, 1))
+                    _archiver(root).create_archive(files, datetime(2026, 8, 1))
             finally:
                 os.chmod(compresso, 0o644)
 
