@@ -348,19 +348,66 @@ class Archiver:
             mode = 'w:gz'
 
         # Create archive
+        inclusi: List[LogFile] = []
+        sostituiti: List[str] = []
+        mancanti: List[str] = []
         with tarfile.open(archive_path, mode, compresslevel=level) as tar:
             for log_file in files:
-                # Calculate checksum before adding
-                log_file.calculate_checksum()
+                # Wazuh comprime i log alla rotazione di mezzanotte: fra il
+                # momento in cui i file vengono elencati e quello in cui
+                # vengono letti, un `.log` puo' diventare `.log.gz`. Prima di
+                # questa gestione la prima eccezione buttava via l'INTERO
+                # archivio (sul campo: 434 MB persi per un solo file in
+                # transito, ricreati solo dal ciclo dell'ora successiva).
+                try:
+                    log_file.calculate_checksum()
+                    arcname = self._get_arcname(log_file)
+                    tar.add(log_file.path, arcname=arcname)
+                except FileNotFoundError:
+                    compresso = Path(str(log_file.path) + '.gz')
+                    if not compresso.exists():
+                        mancanti.append(str(log_file.path))
+                        logger.warning(
+                            f"File sparito durante l'archiviazione e nessuna "
+                            f"versione compressa trovata, escluso: {log_file.path}"
+                        )
+                        continue
+                    originale = log_file.path
+                    log_file.path = compresso
+                    try:
+                        log_file.size = compresso.stat().st_size
+                        log_file.calculate_checksum()
+                        arcname = self._get_arcname(log_file)
+                        tar.add(log_file.path, arcname=arcname)
+                    except OSError as e:
+                        log_file.path = originale
+                        mancanti.append(str(originale))
+                        logger.warning(
+                            f"File sparito durante l'archiviazione e la versione "
+                            f"compressa non e' leggibile ({e}), escluso: {originale}"
+                        )
+                        continue
+                    sostituiti.append(f"{originale.name} -> {compresso.name}")
+                    logger.info(
+                        f"Ruotato durante l'archiviazione, incluso il compresso: "
+                        f"{originale.name} -> {compresso.name}"
+                    )
 
-                # Add file to archive with relative path
-                arcname = self._get_arcname(log_file)
-                tar.add(log_file.path, arcname=arcname)
-
+                inclusi.append(log_file)
                 logger.debug(f"Added to archive: {log_file.path} -> {arcname}")
 
+            if not inclusi:
+                raise ArchiveError(
+                    "Nessuno dei file da archiviare era piu' leggibile: "
+                    f"{len(mancanti)} mancanti"
+                )
+
             # Add manifest of included files
-            manifest = self._create_internal_manifest(files)
+            manifest = self._create_internal_manifest(inclusi)
+            if sostituiti:
+                manifest["rotated_during_archiving"] = sostituiti
+            if mancanti:
+                manifest["missing_at_archiving"] = mancanti
             manifest_path = self.temp_dir / "manifest.json"
             with open(manifest_path, 'w') as f:
                 json.dump(manifest, f, indent=2, default=str)
