@@ -21,7 +21,7 @@ import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional, Tuple, Generator, Dict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import uuid
 
 from models import (
@@ -273,7 +273,7 @@ class Archiver:
 
         try:
             # Create tar archive with compression
-            self._create_tar_archive(files, archive_path)
+            inclusi, sostituiti, mancanti = self._create_tar_archive(files, archive_path)
 
             # Calculate checksum
             checksum = self._calculate_checksum(archive_path)
@@ -283,7 +283,9 @@ class Archiver:
 
             record = ArchiveRecord(
                 id=archive_id,
-                source_files=[str(f.path) for f in files],
+                # Solo i file DAVVERO archiviati: il record e' materiale
+                # probatorio, non deve dichiarare cio' che e' stato escluso.
+                source_files=[str(f.path) for f in inclusi],
                 archive_path=archive_path,
                 archive_size=archive_size,
                 checksum=checksum,
@@ -363,38 +365,49 @@ class Archiver:
                     log_file.calculate_checksum()
                     arcname = self._get_arcname(log_file)
                     tar.add(log_file.path, arcname=arcname)
+                    inclusi.append(log_file)
+                    logger.debug(f"Added to archive: {log_file.path} -> {arcname}")
+                    continue
                 except FileNotFoundError:
-                    compresso = Path(str(log_file.path) + '.gz')
-                    if not compresso.exists():
-                        mancanti.append(str(log_file.path))
-                        logger.warning(
-                            f"File sparito durante l'archiviazione e nessuna "
-                            f"versione compressa trovata, escluso: {log_file.path}"
-                        )
-                        continue
-                    originale = log_file.path
-                    log_file.path = compresso
-                    try:
-                        log_file.size = compresso.stat().st_size
-                        log_file.calculate_checksum()
-                        arcname = self._get_arcname(log_file)
-                        tar.add(log_file.path, arcname=arcname)
-                    except OSError as e:
-                        log_file.path = originale
-                        mancanti.append(str(originale))
-                        logger.warning(
-                            f"File sparito durante l'archiviazione e la versione "
-                            f"compressa non e' leggibile ({e}), escluso: {originale}"
-                        )
-                        continue
-                    sostituiti.append(f"{originale.name} -> {compresso.name}")
-                    logger.info(
-                        f"Ruotato durante l'archiviazione, incluso il compresso: "
-                        f"{originale.name} -> {compresso.name}"
-                    )
+                    pass
 
-                inclusi.append(log_file)
-                logger.debug(f"Added to archive: {log_file.path} -> {arcname}")
+                compresso = Path(str(log_file.path) + '.gz')
+                if not compresso.exists():
+                    mancanti.append(str(log_file.path))
+                    logger.warning(
+                        f"File sparito durante l'archiviazione e nessuna versione "
+                        f"compressa trovata, escluso: {log_file.path}"
+                    )
+                    continue
+
+                # Un SOSTITUTO, non una mutazione: gli oggetti passati dal
+                # chiamante non vanno alterati, e checksum e dimensione devono
+                # riferirsi al file davvero archiviato.
+                try:
+                    sostituto = replace(
+                        log_file, path=compresso,
+                        size=compresso.stat().st_size, checksum=None,
+                    )
+                    sostituto.calculate_checksum()
+                    arcname = self._get_arcname(sostituto)
+                except FileNotFoundError:
+                    mancanti.append(str(log_file.path))
+                    logger.warning(
+                        f"File sparito durante l'archiviazione e la versione compressa "
+                        f"e' sparita a sua volta, escluso: {log_file.path}"
+                    )
+                    continue
+
+                # Fuori dal try: un errore che NON sia "file mancante" (permessi,
+                # I/O, disco pieno) deve far fallire il ciclo, non essere
+                # riclassificato come file in transito.
+                tar.add(sostituto.path, arcname=arcname)
+                sostituiti.append(f"{log_file.path.name} -> {compresso.name}")
+                logger.info(
+                    f"Ruotato durante l'archiviazione, incluso il compresso: "
+                    f"{log_file.path.name} -> {compresso.name}"
+                )
+                inclusi.append(sostituto)
 
             if not inclusi:
                 raise ArchiveError(
@@ -413,6 +426,8 @@ class Archiver:
                 json.dump(manifest, f, indent=2, default=str)
             tar.add(manifest_path, arcname="manifest.json")
             manifest_path.unlink()
+
+        return inclusi, sostituiti, mancanti
 
     def _get_arcname(self, log_file: LogFile) -> str:
         """Generate archive name for a file preserving date structure"""

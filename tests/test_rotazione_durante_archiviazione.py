@@ -138,5 +138,63 @@ class TestRotazioneDuranteArchiviazione(unittest.TestCase):
             self.assertIn("ossec-alerts-02.json", nomi)
 
 
+    def test_il_record_non_dichiara_i_file_esclusi(self):
+        """Il record e' materiale probatorio: dichiarare un file escluso come
+        archiviato e' peggio del fallimento che questa modifica evita."""
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            buono = root / "ossec-alerts-02.json"; buono.write_text("rimasto\n")
+            ruotato = root / "ossec-alerts-01.log"; ruotato.write_text("x\n")
+            perso = root / "ossec-archive-01.log"; perso.write_text("y\n")
+            files = [_logfile(buono), _logfile(ruotato), _logfile(perso)]
+            compresso = root / "ossec-alerts-01.log.gz"
+            compresso.write_bytes(b"compresso")
+            ruotato.unlink(); perso.unlink()
+
+            arch = _archiver(root)
+            record = arch.create_archive(files, datetime(2026, 8, 1))
+
+            self.assertNotIn(str(perso), record.source_files,
+                             "un file escluso non deve comparire fra le sorgenti dichiarate")
+            self.assertIn(str(compresso), record.source_files,
+                          "il sostituto compresso deve comparire, non l'originale sparito")
+            self.assertNotIn(str(ruotato), record.source_files)
+            self.assertIn(str(buono), record.source_files)
+
+    def test_gli_oggetti_del_chiamante_non_vengono_alterati(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ruotato = root / "ossec-alerts-01.log"; ruotato.write_text("x\n")
+            lf = _logfile(ruotato)
+            dimensione_prima, percorso_prima = lf.size, lf.path
+            (root / "ossec-alerts-01.log.gz").write_bytes(b"compresso piu lungo del semplice")
+            ruotato.unlink()
+
+            _archiver(root).create_archive([lf], datetime(2026, 8, 1))
+
+            self.assertEqual(lf.path, percorso_prima, "il path del chiamante e' stato mutato")
+            self.assertEqual(lf.size, dimensione_prima, "la dimensione del chiamante e' stata mutata")
+
+    @unittest.skipIf(hasattr(__import__("os"), "geteuid") and __import__("os").geteuid() == 0,
+                     "da root i permessi non bloccano la lettura")
+    def test_un_errore_diverso_da_file_mancante_fa_fallire_il_ciclo(self):
+        """Permessi negati sul sostituto non devono essere riclassificati come
+        'file in transito' ed esclusi in silenzio."""
+        import os
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ruotato = root / "ossec-alerts-01.log"; ruotato.write_text("x\n")
+            lf = _logfile(ruotato)
+            compresso = root / "ossec-alerts-01.log.gz"
+            compresso.write_bytes(b"compresso")
+            ruotato.unlink()
+            os.chmod(compresso, 0o000)
+            try:
+                with self.assertRaises(ArchiveError):
+                    _archiver(root).create_archive([lf], datetime(2026, 8, 1))
+            finally:
+                os.chmod(compresso, 0o644)
+
+
 if __name__ == "__main__":
     unittest.main()
