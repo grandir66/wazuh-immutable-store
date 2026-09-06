@@ -84,3 +84,6 @@ manifests/
 *.pem
 credentials*
 secrets*
+
+# configurazione locale dell'agente: questo repo è PUBBLICO
+.claude/
