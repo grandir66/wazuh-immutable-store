@@ -3,7 +3,7 @@ badge: Maturo
 tono: ok
 famiglia: 04-wazuh
 ordine: 100
-stato: fermo
+stato: manutenzione
 prossimo: verificare la retention degli snapshot OpenSearch→MinIO e il POC TrueNAS WORM
 ---
 Archiviazione immutabile dei log Wazuh su QNAP WORM: firma GPG, hash chain SHA256, retention e verifica via systemd.
