@@ -58,7 +58,7 @@ ss -tnp state established 'sport = :22'
 Casi comuni:
 
 - IP nella **LAN dello stesso cliente** (`10.10.x.x` se quello è il subnet) → `ufw allow from 10.10.0.0/16 to any port 22 proto tcp`
-- IP del **subnet router Tailscale** (`100.64.x.x` o NAT interno tipo `10.20.100.x`) → `ufw allow from 10.20.100.0/24 to any port 22 proto tcp`
+- IP della **VPN degli operatori** (NetBird `100.64.0.0/10`, o NAT interno tipo `10.20.100.x`) → `ufw allow from 10.20.100.0/24 to any port 22 proto tcp`
 - **Mai chiudere SSH** prima di aver mappato il tuo IP attuale di accesso.
 
 ### Domanda 4 — Vuoi PasswordAuth disabilitata totalmente o limitata?

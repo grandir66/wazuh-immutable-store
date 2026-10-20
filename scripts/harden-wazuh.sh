@@ -284,7 +284,7 @@ EOF
 
   # SSH
   echo -e "${BOLD}SSH (porta 22/tcp)${NC} — chi gestisce il server in remoto?"
-  echo "   Default suggerito: subnet di Tailscale gateway (più sicuro di LAN aperta)"
+  echo "   Default suggerito: subnet della VPN degli operatori (NetBird o la VPN del cliente: più sicuro di LAN aperta)"
   local ssh_sources
   ssh_sources=$(ask_input "Sorgenti SSH" "172.17.100.0/24")
 
@@ -298,14 +298,14 @@ EOF
   # Dashboard
   echo
   echo -e "${BOLD}Wazuh Dashboard (porta 443/tcp)${NC} — chi accede alla UI?"
-  echo "   Opzioni comuni: solo operatori Tailscale, o anche IT cliente da LAN"
+  echo "   Opzioni comuni: solo operatori dalla VPN (NetBird), o anche IT cliente da LAN"
   local dash_sources
   dash_sources=$(ask_input "Sorgenti Dashboard (vuoto = chiuso)" "172.17.100.0/24")
 
   # Indexer
   echo
   echo -e "${BOLD}Wazuh Indexer / OpenSearch (porta 9200/tcp)${NC} — quali integrazioni?"
-  echo "   Default: solo operatori Tailscale + eventuali integrazioni (es. DA-IPAM)"
+  echo "   Default: solo operatori dalla VPN (NetBird) + eventuali integrazioni (es. DA-IPAM)"
   local indexer_sources
   indexer_sources=$(ask_input "Sorgenti Indexer (vuoto = chiuso)" "172.17.100.0/24")
 
@@ -443,7 +443,7 @@ EOF
 
   ${BOLD}3. MANTIENI PasswordAuth limitato${NC} (compromesso)
      Invece di disabilitare totalmente PasswordAuthentication, lo limito
-     SOLO ad una subnet di trust (es. Tailscale gateway) via Match Address.
+     SOLO ad una subnet di trust (es. la VPN degli operatori) via Match Address.
      Brute force impossibile da Internet, ma fallback password disponibile.
 
 EOF
