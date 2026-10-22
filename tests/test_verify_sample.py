@@ -72,6 +72,9 @@ class FakeGPGSigner:
     def verify_signature(self, file_path: Path, signature_path: Path) -> bool:
         return file_path.name not in self._invalid_for
 
+    def verify_signature_esito(self, file_path: Path, signature_path: Path) -> str:
+        return 'valida' if self.verify_signature(file_path, signature_path) else 'non valida'
+
 
 def _make_signing_manager(manifest_dir: Path, sample_per_run: int = 10) -> SigningManager:
     gpg_config = GPGConfig(enabled=False)  # niente subprocess gpg in __init__

@@ -47,6 +47,15 @@ class ManifestCorruptedError(Exception):
     pass
 
 
+def tempo_verifica_gpg(dimensione_byte: int) -> int:
+    """Secondi concessi a `gpg --verify`: crescono con il file, che spesso si rilegge via NFS.
+
+    Prima erano 60 fissi: su DTS (22/10/2026) gli archivi da 3-4 GB andavano tutti oltre.
+    120 secondi per GB, mai meno di 5 minuti.
+    """
+    return max(300, int(dimensione_byte / 1024 ** 3 * 120))
+
+
 class GPGSigner:
     """Handles GPG signing operations for archives"""
 
@@ -139,19 +148,25 @@ class GPGSigner:
             raise SigningError("GPG signing timed out")
 
     def verify_signature(self, file_path: Path, signature_path: Optional[Path] = None) -> bool:
-        """
+        """True solo se la firma è stata verificata (vedi verify_signature_esito)."""
+        return self.verify_signature_esito(file_path, signature_path) == 'valida'
+
+    def verify_signature_esito(self, file_path: Path, signature_path: Optional[Path] = None) -> str:
+        """Esito della verifica della firma: 'valida', 'non valida' o 'non conclusa'.
+
+        'non conclusa' = gpg oltre il tempo concesso: la firma non è stata provata né
+        smentita (DTS, 22/10/2026: 21 archivi segnati «non validi» erano solo timeout).
+
         Verify GPG signature of a file
 
         Args:
             file_path: Path to signed file
             signature_path: Path to detached signature (optional)
 
-        Returns:
-            True if signature is valid
         """
         if not file_path.exists():
             logger.error(f"File not found: {file_path}")
-            return False
+            return 'non valida'
 
         # Determine signature path
         if signature_path is None:
@@ -159,7 +174,7 @@ class GPGSigner:
 
         if not signature_path.exists():
             logger.error(f"Signature not found: {signature_path}")
-            return False
+            return 'non valida'
 
         cmd = ['gpg', '--batch', '--verify']
 
@@ -173,19 +188,19 @@ class GPGSigner:
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=60
+                timeout=tempo_verifica_gpg(file_path.stat().st_size)
             )
 
             if result.returncode == 0:
                 logger.info(f"Signature verified: {file_path}")
-                return True
+                return 'valida'
             else:
                 logger.error(f"Signature verification failed: {result.stderr}")
-                return False
+                return 'non valida'
 
         except subprocess.TimeoutExpired:
-            logger.error("Signature verification timed out")
-            return False
+            logger.error(f"Signature verification timed out (non conclusa): {file_path}")
+            return 'non conclusa'
 
     def get_key_info(self) -> dict:
         """Get information about the signing key"""
@@ -714,8 +729,12 @@ class SigningManager:
                 sig_path = archive_path.with_suffix(archive_path.suffix + '.sig')
                 if not sig_path.exists():
                     errors.append("firma GPG (.sig) mancante")
-                elif not self.gpg_signer.verify_signature(archive_path, sig_path):
-                    errors.append("firma GPG non valida")
+                else:
+                    esito = self.gpg_signer.verify_signature_esito(archive_path, sig_path)
+                    if esito == 'non conclusa':
+                        errors.append("verifica della firma GPG non conclusa (gpg oltre il tempo concesso)")
+                    elif esito != 'valida':
+                        errors.append("firma GPG non valida")
 
         except OSError as e:
             # File system/NFS irraggiungibile a metà lettura: non deve
