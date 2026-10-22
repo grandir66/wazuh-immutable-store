@@ -47,6 +47,21 @@ class TestSystemdReadWritePaths(unittest.TestCase):
             testo = (SYSTEMD_DIR / nome).read_text()
             self.assertIn('ProtectSystem=strict', testo)
 
+    def test_le_tre_unit_possono_scrivere_nella_home_di_gpg(self):
+        """DTS, 18/10/2026: la verifica settimanale falliva con «GPG key not found» dal 20/09.
+
+        Con ProtectHome=read-only e /root/.gnupg non scrivibile, gpg non crea il file di lock né
+        il socket dell'agente: «can't connect to the gpg-agent: Read-only file system», la chiave
+        segreta non si vede e SigningManager si ferma. Sul server un drop-in metteva perfino
+        ReadOnlyPaths=/root/.gnupg, che vince sul ReadWritePaths. Da shell funziona sempre.
+        """
+        for nome in UNIT_CHE_SCRIVONO_LO_STATO:
+            testo = (SYSTEMD_DIR / nome).read_text()
+            self.assertIn('ReadWritePaths=/root/.gnupg', testo,
+                          "%s: gpg non può avviare l'agente in /root/.gnupg" % nome)
+            self.assertNotIn('ReadOnlyPaths=/root/.gnupg', testo,
+                             "%s: ReadOnlyPaths su /root/.gnupg vince sul ReadWritePaths" % nome)
+
 
 if __name__ == '__main__':
     unittest.main()

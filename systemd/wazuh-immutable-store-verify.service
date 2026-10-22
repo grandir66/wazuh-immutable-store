@@ -26,6 +26,8 @@ ReadOnlyPaths=/tmp/wazuh-archive
 ReadOnlyPaths=/mnt/qnap-wazuh
 ReadWritePaths=/var/log
 ReadWritePaths=/var/lib/wazuh-immutable-store
+# gpg crea lock e socket dell'agente qui: in sola lettura la chiave non si vede (DTS, 18/10/2026)
+ReadWritePaths=/root/.gnupg
 
 [Install]
 WantedBy=multi-user.target
